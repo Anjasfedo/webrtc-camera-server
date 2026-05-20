@@ -1,14 +1,4 @@
-//! Per-peer WebRTC state.
-//!
-//! One `Peer` per connected client. Owns the GStreamer pipeline and wires
-//! `webrtcbin` callbacks (`on-negotiation-needed`, `on-ice-candidate`) into
-//! the signaling channel back to the WebSocket.
-//!
-//! Negotiation flow:
-//!   1. Pipeline starts -> webrtcbin emits `on-negotiation-needed`.
-//!   2. We call `create-offer`, get back an SDP, send it to the client.
-//!   3. Client responds with `Answer` -> we set it as the remote description.
-//!   4. ICE candidates flow both ways in parallel.
+//! Per-peer WebRTC signaling, layered on top of the shared pipeline.
 
 use anyhow::{Result, anyhow};
 use gstreamer as gst;
@@ -19,54 +9,49 @@ use gstreamer_webrtc as gst_webrtc;
 use tokio::sync::mpsc;
 use tracing::{debug, error, warn};
 
-use crate::pipeline::CameraPipeline;
+use crate::pipeline::{PeerBranch, SharedPipeline};
 use crate::signaling::SignalingMessage;
 
 pub struct Peer {
-    pipeline: CameraPipeline,
+    _branch: PeerBranch,
 }
 
 impl Peer {
-    /// Build a new pipeline and connect the signaling callbacks.
-    /// `outbound` is the channel used to send messages to the WebSocket client.
-    pub fn new(outbound: mpsc::UnboundedSender<SignalingMessage>) -> Result<Self> {
-        let pipeline = CameraPipeline::new()?;
-        wire_webrtc_signals(&pipeline.webrtcbin, outbound);
-        Ok(Self { pipeline })
+    /// Attach a new branch to the shared pipeline and wire WebRTC signals
+    /// into the outbound signaling channel.
+    pub fn new(
+        shared: &SharedPipeline,
+        outbound: mpsc::UnboundedSender<SignalingMessage>,
+    ) -> Result<Self> {
+        let branch = shared.attach_peer(|webrtcbin| {
+            wire_webrtc_signals(webrtcbin, outbound);
+        })?;
+        Ok(Self { _branch: branch })
     }
 
-    pub fn start(&self) -> Result<()> {
-        self.pipeline.start()
-    }
-
-    /// Apply an SDP answer received from the client.
     pub fn handle_answer(&self, sdp: &str) -> Result<()> {
         let sdp_msg = gst_sdp::SDPMessage::parse_buffer(sdp.as_bytes())
             .map_err(|_| anyhow!("Failed to parse answer SDP"))?;
         let answer =
             gst_webrtc::WebRTCSessionDescription::new(gst_webrtc::WebRTCSDPType::Answer, sdp_msg);
-        self.pipeline
+        self._branch
             .webrtcbin
             .emit_by_name::<()>("set-remote-description", &[&answer, &None::<gst::Promise>]);
         Ok(())
     }
 
-    /// Add a remote ICE candidate received from the client.
     pub fn handle_ice_candidate(&self, candidate: &str, sdp_mline_index: u32) -> Result<()> {
-        self.pipeline
+        self._branch
             .webrtcbin
             .emit_by_name::<()>("add-ice-candidate", &[&sdp_mline_index, &candidate]);
         Ok(())
     }
 }
 
-/// Hook up webrtcbin's signals so the offer + local ICE candidates get pushed
-/// out over the signaling channel.
 fn wire_webrtc_signals(
     webrtcbin: &gst::Element,
     outbound: mpsc::UnboundedSender<SignalingMessage>,
 ) {
-    // `on-negotiation-needed` fires once the pipeline is ready to create an SDP.
     let tx = outbound.clone();
     webrtcbin.connect_closure(
         "on-negotiation-needed",
@@ -78,34 +63,60 @@ fn wire_webrtc_signals(
         }),
     );
 
-    // Each locally-gathered ICE candidate is forwarded to the client.
-    let tx = outbound.clone();
+    let tx = outbound;
     webrtcbin.connect_closure(
         "on-ice-candidate",
         false,
         glib::closure!(
             move |_webrtc: &gst::Element, mline_index: u32, candidate: &str| {
-                let msg = SignalingMessage::IceCandidate {
+                // Original candidate, as webrtcbin emitted it.
+                let original = SignalingMessage::IceCandidate {
                     candidate: candidate.to_string(),
                     sdp_mline_index: mline_index,
                 };
-                if tx.send(msg).is_err() {
+                if tx.send(original).is_err() {
                     warn!("Signaling channel closed; ICE candidate dropped");
+                    return;
+                }
+
+                // Emulator workaround: also broadcast a copy with the server's
+                // LAN IP rewritten to 10.0.2.2 (qemu's host alias). Real
+                // browsers and physical devices ignore this; Android emulator
+                // peers can route to it.
+                for rewritten in emulator_aliases(candidate) {
+                    let alias = SignalingMessage::IceCandidate {
+                        candidate: rewritten,
+                        sdp_mline_index: mline_index,
+                    };
+                    let _ = tx.send(alias);
                 }
             }
         ),
     );
 }
 
-/// Trigger `create-offer`, then `set-local-description` and forward the SDP
-/// to the client over the signaling channel.
+/// If the candidate string contains the server's LAN IP, produce a copy with
+/// that IP swapped for 10.0.2.2 so an Android emulator peer can reach us.
+/// Returns an empty vec for candidates that don't match (loopback, IPv6,
+/// public srflx) — we don't want to spam the client with garbage.
+fn emulator_aliases(candidate: &str) -> Vec<String> {
+    // Hardcoded for now. If you ever change networks, update this.
+    // (Alternatively, detect the primary IPv4 at startup and pass it in.)
+    const SERVER_LAN_IP: &str = "192.168.1.103";
+    const EMULATOR_HOST_ALIAS: &str = "10.0.2.2";
+
+    if !candidate.contains(SERVER_LAN_IP) {
+        return Vec::new();
+    }
+    vec![candidate.replace(SERVER_LAN_IP, EMULATOR_HOST_ALIAS)]
+}
+
 fn create_and_send_offer(
     webrtcbin: &gst::Element,
     tx: mpsc::UnboundedSender<SignalingMessage>,
 ) -> Result<()> {
     let webrtcbin_inner = webrtcbin.clone();
 
-    // The promise fires when webrtcbin has produced the offer.
     let promise = gst::Promise::with_change_func(move |reply| {
         let reply = match reply {
             Ok(Some(r)) => r,
@@ -127,17 +138,14 @@ fn create_and_send_offer(
             }
         };
 
-        // Apply locally...
         webrtcbin_inner
             .emit_by_name::<()>("set-local-description", &[&offer, &None::<gst::Promise>]);
 
-        // ...then send to the client.
         let sdp = offer.sdp().as_text().unwrap_or_default();
         debug!("Sending offer SDP ({} bytes)", sdp.len());
         let _ = tx.send(SignalingMessage::Offer { sdp });
     });
 
     webrtcbin.emit_by_name::<()>("create-offer", &[&None::<gst::Structure>, &promise]);
-
     Ok(())
 }

@@ -1,0 +1,129 @@
+<!doctype html>
+<html>
+  <head>
+    <meta charset="UTF-8" />
+    <title>WebRTC Camera Test</title>
+    <style>
+      body {
+        font-family: sans-serif;
+        background: #111;
+        color: #eee;
+        padding: 20px;
+        max-width: 900px;
+        margin: auto;
+      }
+      video {
+        width: 100%;
+        background: #000;
+        border-radius: 8px;
+        margin-top: 16px;
+      }
+      button {
+        background: #3b65f5;
+        color: white;
+        border: 0;
+        padding: 10px 20px;
+        font-size: 15px;
+        border-radius: 6px;
+        cursor: pointer;
+      }
+      button:disabled {
+        background: #555;
+      }
+      #log {
+        background: #1a1a1d;
+        padding: 12px;
+        margin-top: 16px;
+        font-family: monospace;
+        font-size: 12px;
+        height: 200px;
+        overflow-y: auto;
+        white-space: pre-wrap;
+      }
+    </style>
+  </head>
+  <body>
+    <h1>WebRTC Camera Test</h1>
+    <button id="start">Start Stream</button>
+    <video id="video" autoplay playsinline muted></video>
+    <div id="log"></div>
+
+    <script>
+      const video = document.getElementById("video");
+      const startBtn = document.getElementById("start");
+      const logEl = document.getElementById("log");
+
+      function log(msg) {
+        console.log(msg);
+        logEl.textContent += msg + "\n";
+        logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      startBtn.addEventListener("click", async () => {
+        startBtn.disabled = true;
+
+        const ws = new WebSocket(`ws://${location.host}/ws`);
+        const pc = new RTCPeerConnection({
+          iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
+        });
+
+        pc.ontrack = (event) => {
+          log("Track received");
+          video.srcObject = event.streams[0];
+        };
+
+        pc.oniceconnectionstatechange = () =>
+          log("ICE: " + pc.iceConnectionState);
+
+        pc.onicecandidate = (event) => {
+          if (event.candidate) {
+            ws.send(
+              JSON.stringify({
+                type: "ice_candidate",
+                candidate: event.candidate.candidate,
+                sdp_mline_index: event.candidate.sdpMLineIndex,
+              }),
+            );
+          }
+        };
+
+        ws.onopen = () => {
+          log("WS open, sending start");
+          ws.send(JSON.stringify({ type: "start" }));
+        };
+
+        ws.onmessage = async (event) => {
+          let msg;
+          try {
+            msg = JSON.parse(event.data);
+          } catch (e) {
+            log("Ignoring non-JSON: " + event.data);
+            return;
+          }
+          log("<- " + msg.type);
+
+          if (msg.type === "offer") {
+            await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
+            const answer = await pc.createAnswer();
+            await pc.setLocalDescription(answer);
+            ws.send(JSON.stringify({ type: "answer", sdp: answer.sdp }));
+          } else if (msg.type === "ice_candidate") {
+            try {
+              await pc.addIceCandidate({
+                candidate: msg.candidate,
+                sdpMLineIndex: msg.sdp_mline_index,
+              });
+            } catch (e) {
+              log("addIceCandidate failed: " + e);
+            }
+          }
+        };
+
+        ws.onclose = () => {
+          log("WS closed");
+          startBtn.disabled = false;
+        };
+      });
+    </script>
+  </body>
+</html>

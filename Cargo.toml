@@ -26,6 +26,7 @@ serde_json = "1"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 anyhow = "1"
+sysinfo = "0.38.4"
 
 [profile.release]
 opt-level = 3

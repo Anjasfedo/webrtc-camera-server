@@ -27,12 +27,12 @@ pub struct SharedPipeline {
 impl SharedPipeline {
     pub fn new() -> Result<Self> {
         let pipeline_str = format!(
-            "mfvideosrc device-index=0 ! \
+            "v4l2src device=/dev/video0 ! \
              image/jpeg,width={w},height={h},framerate={fps}/1 ! \
              jpegdec ! \
              videoconvert ! \
-             video/x-raw,format=NV12 ! \
-             mfh264enc bitrate={br} low-latency=true ! \
+             video/x-raw,format=I420 ! \
+             x264enc bitrate={br} tune=zerolatency speed-preset=ultrafast ! \
              h264parse config-interval=-1 ! \
              rtph264pay pt=96 mtu=1200 aggregate-mode=zero-latency ! \
              application/x-rtp,media=video,encoding-name=H264,payload=96 ! \

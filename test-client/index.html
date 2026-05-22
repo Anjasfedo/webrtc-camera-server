@@ -12,12 +12,36 @@
         max-width: 900px;
         margin: auto;
       }
+      .video-container {
+        position: relative;
+        margin-top: 16px;
+      }
       video {
         width: 100%;
         background: #000;
         border-radius: 8px;
-        margin-top: 16px;
+        display: block;
       }
+      /* Floating stats overlay */
+      #stats-overlay {
+        position: absolute;
+        top: 10px;
+        left: 10px;
+        background: rgba(0, 0, 0, 0.7);
+        padding: 10px 15px;
+        border-radius: 6px;
+        font-family: monospace;
+        font-size: 14px;
+        color: #0f0;
+        pointer-events: none; /* Let clicks pass through to video */
+      }
+      .stat-row {
+        margin: 4px 0;
+      }
+      .stat-label {
+        color: #aaa;
+      }
+
       button {
         background: #3b65f5;
         color: white;
@@ -45,7 +69,24 @@
   <body>
     <h1>WebRTC Camera Test</h1>
     <button id="start">Start Stream</button>
-    <video id="video" autoplay playsinline muted></video>
+
+    <div class="video-container">
+      <video id="video" autoplay playsinline muted></video>
+      <div id="stats-overlay">
+        <div class="stat-row">
+          <span class="stat-label">FPS:</span> <span id="stat-fps">0</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Bitrate:</span>
+          <span id="stat-bitrate">0 kbps</span>
+        </div>
+        <div class="stat-row">
+          <span class="stat-label">Resolution:</span>
+          <span id="stat-res">0x0</span>
+        </div>
+      </div>
+    </div>
+
     <div id="log"></div>
 
     <script>
@@ -53,23 +94,86 @@
       const startBtn = document.getElementById("start");
       const logEl = document.getElementById("log");
 
+      const statFps = document.getElementById("stat-fps");
+      const statBitrate = document.getElementById("stat-bitrate");
+      const statRes = document.getElementById("stat-res");
+
+      let pc;
+      let statsInterval;
+
       function log(msg) {
         console.log(msg);
         logEl.textContent += msg + "\n";
         logEl.scrollTop = logEl.scrollHeight;
       }
 
+      function startStatsLoop() {
+        let lastResult = null;
+
+        statsInterval = setInterval(async () => {
+          if (!pc) return;
+
+          const stats = await pc.getStats();
+          stats.forEach((report) => {
+            // We only care about the inbound video track
+            if (report.type === "inbound-rtp" && report.kind === "video") {
+              let currentFps = 0;
+              let currentRes = "0x0";
+
+              // 1. Framerate
+              if (report.framesPerSecond !== undefined) {
+                currentFps = report.framesPerSecond;
+                statFps.innerText = currentFps;
+              }
+
+              // 2. Resolution
+              if (report.frameWidth && report.frameHeight) {
+                currentRes = `${report.frameWidth}x${report.frameHeight}`;
+                statRes.innerText = currentRes;
+              }
+
+              // 3. Bitrate Calculation & Logging
+              if (lastResult && lastResult.has(report.id)) {
+                const lastReport = lastResult.get(report.id);
+
+                // Bytes received difference
+                const bytesDiff =
+                  report.bytesReceived - lastReport.bytesReceived;
+                // Time difference in milliseconds
+                const timeDiff = report.timestamp - lastReport.timestamp;
+
+                if (timeDiff > 0) {
+                  // kbps = (bytes * 8 bits/byte) / (time_ms / 1000) / 1000
+                  const kbps = (bytesDiff * 8) / (timeDiff / 1000) / 1000;
+                  const bitrateStr = kbps.toFixed(2);
+
+                  statBitrate.innerText = bitrateStr + " kbps";
+
+                  // --- NEW: Log the metrics to the text box ---
+                  log(
+                    `[Metrics] FPS: ${currentFps} | Bitrate: ${bitrateStr} kbps | Res: ${currentRes}`,
+                  );
+                }
+              }
+            }
+          });
+
+          lastResult = stats;
+        }, 1000); // Check every 1 second
+      }
+
       startBtn.addEventListener("click", async () => {
         startBtn.disabled = true;
 
         const ws = new WebSocket(`ws://${location.host}/ws`);
-        const pc = new RTCPeerConnection({
+        pc = new RTCPeerConnection({
           iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
         });
 
         pc.ontrack = (event) => {
           log("Track received");
           video.srcObject = event.streams[0];
+          startStatsLoop(); // Start gathering metrics once video arrives
         };
 
         pc.oniceconnectionstatechange = () =>
@@ -122,6 +226,7 @@
         ws.onclose = () => {
           log("WS closed");
           startBtn.disabled = false;
+          clearInterval(statsInterval);
         };
       });
     </script>

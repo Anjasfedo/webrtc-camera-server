@@ -22,7 +22,6 @@
         border-radius: 8px;
         display: block;
       }
-      /* Floating stats overlay */
       #stats-overlay {
         position: absolute;
         top: 10px;
@@ -33,7 +32,7 @@
         font-family: monospace;
         font-size: 14px;
         color: #0f0;
-        pointer-events: none; /* Let clicks pass through to video */
+        pointer-events: none;
       }
       .stat-row {
         margin: 4px 0;
@@ -84,6 +83,10 @@
           <span class="stat-label">Resolution:</span>
           <span id="stat-res">0x0</span>
         </div>
+        <div class="stat-row">
+          <span class="stat-label">Latency:</span>
+          <span id="stat-latency">0 ms</span>
+        </div>
       </div>
     </div>
 
@@ -97,6 +100,7 @@
       const statFps = document.getElementById("stat-fps");
       const statBitrate = document.getElementById("stat-bitrate");
       const statRes = document.getElementById("stat-res");
+      const statLatency = document.getElementById("stat-latency");
 
       let pc;
       let statsInterval;
@@ -114,52 +118,60 @@
           if (!pc) return;
 
           const stats = await pc.getStats();
-          stats.forEach((report) => {
-            // We only care about the inbound video track
-            if (report.type === "inbound-rtp" && report.kind === "video") {
-              let currentFps = 0;
-              let currentRes = "0x0";
 
-              // 1. Framerate
+          let currentFps = 0;
+          let currentRes = "0x0";
+          let bitrateStr = "0.00";
+          let currentRtt = "0";
+          let hasDataToLog = false;
+
+          stats.forEach((report) => {
+            if (
+              report.type === "candidate-pair" &&
+              report.state === "succeeded"
+            ) {
+              if (report.currentRoundTripTime !== undefined) {
+                currentRtt = (report.currentRoundTripTime * 1000).toFixed(0);
+                statLatency.innerText = currentRtt + " ms";
+              }
+            }
+
+            if (report.type === "inbound-rtp" && report.kind === "video") {
+              hasDataToLog = true;
+
               if (report.framesPerSecond !== undefined) {
                 currentFps = report.framesPerSecond;
                 statFps.innerText = currentFps;
               }
 
-              // 2. Resolution
               if (report.frameWidth && report.frameHeight) {
                 currentRes = `${report.frameWidth}x${report.frameHeight}`;
                 statRes.innerText = currentRes;
               }
 
-              // 3. Bitrate Calculation & Logging
               if (lastResult && lastResult.has(report.id)) {
                 const lastReport = lastResult.get(report.id);
-
-                // Bytes received difference
                 const bytesDiff =
                   report.bytesReceived - lastReport.bytesReceived;
-                // Time difference in milliseconds
                 const timeDiff = report.timestamp - lastReport.timestamp;
 
                 if (timeDiff > 0) {
-                  // kbps = (bytes * 8 bits/byte) / (time_ms / 1000) / 1000
                   const kbps = (bytesDiff * 8) / (timeDiff / 1000) / 1000;
-                  const bitrateStr = kbps.toFixed(2);
-
+                  bitrateStr = kbps.toFixed(2);
                   statBitrate.innerText = bitrateStr + " kbps";
-
-                  // --- NEW: Log the metrics to the text box ---
-                  log(
-                    `[Metrics] FPS: ${currentFps} | Bitrate: ${bitrateStr} kbps | Res: ${currentRes}`,
-                  );
                 }
               }
             }
           });
 
+          if (hasDataToLog) {
+            log(
+              `[Metrics] FPS: ${currentFps} | Bitrate: ${bitrateStr} kbps | Res: ${currentRes} | Latency: ${currentRtt} ms`,
+            );
+          }
+
           lastResult = stats;
-        }, 1000); // Check every 1 second
+        }, 1000);
       }
 
       startBtn.addEventListener("click", async () => {
@@ -173,7 +185,7 @@
         pc.ontrack = (event) => {
           log("Track received");
           video.srcObject = event.streams[0];
-          startStatsLoop(); // Start gathering metrics once video arrives
+          startStatsLoop();
         };
 
         pc.oniceconnectionstatechange = () =>

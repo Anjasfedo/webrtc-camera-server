@@ -14,9 +14,9 @@ use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
 use gstreamer::prelude::*;
 
-pub const VIDEO_WIDTH: u32 = 2048;
-pub const VIDEO_HEIGHT: u32 = 1536;
-pub const VIDEO_FRAMERATE: u32 = 20;
+pub const VIDEO_WIDTH: u32 = 1920;
+pub const VIDEO_HEIGHT: u32 = 1080;
+pub const VIDEO_FRAMERATE: u32 = 30;
 pub const VIDEO_BITRATE_KBPS: u32 = 6000;
 
 pub struct SharedPipeline {

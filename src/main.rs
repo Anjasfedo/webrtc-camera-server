@@ -11,6 +11,7 @@ use axum::{Router, routing::get};
 use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::info;
 
+mod camera;
 mod peer;
 mod pipeline;
 mod signaling;

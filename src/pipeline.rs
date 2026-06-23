@@ -26,8 +26,10 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
 
+use crate::camera::CameraCap;
+
 /// Mutable video parameters for the shared capture+encode chain.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct VideoConfig {
     pub width: u32,
     pub height: u32,
@@ -61,13 +63,15 @@ const fn default_format() -> &'static str {
 }
 
 impl VideoConfig {
-    /// Reject obviously-invalid params before we hand them to GStreamer.
-    fn validate(&self) -> Result<()> {
+    /// Reject params the camera can't deliver before handing them to GStreamer.
+    ///
+    /// `caps` is the probed capability list. When non-empty we require the
+    /// requested resolution+framerate to match a real capture mode (the camera
+    /// ties these together). When empty (probe found nothing) we fall back to
+    /// generic sanity bounds so the server still works.
+    fn validate(&self, caps: &[CameraCap]) -> Result<()> {
         if self.width == 0 || self.height == 0 {
             return Err(anyhow!("width/height must be non-zero"));
-        }
-        if self.width > 7680 || self.height > 4320 {
-            return Err(anyhow!("resolution above 8K is not allowed"));
         }
         if self.framerate == 0 || self.framerate > 240 {
             return Err(anyhow!("framerate must be 1..=240"));
@@ -75,14 +79,32 @@ impl VideoConfig {
         if self.bitrate_kbps == 0 || self.bitrate_kbps > 100_000 {
             return Err(anyhow!("bitrate_kbps must be 1..=100000"));
         }
-        // GStreamer caps are picky about format strings; allow only known-good
-        // raw formats so a typo can't wedge the pipeline rebuild.
+        // `format` is the encoder's INPUT format (videoconvert bridges from the
+        // camera's native format), so validate it against the encoder, not the
+        // camera. mfh264enc needs NV12; x264enc takes I420.
         const ALLOWED: [&str; 4] = ["I420", "NV12", "YUY2", "BGRA"];
         if !ALLOWED.contains(&self.format.as_str()) {
             return Err(anyhow!(
                 "format must be one of {ALLOWED:?}, got {:?}",
                 self.format
             ));
+        }
+
+        if !caps.is_empty() {
+            let (w, h, fps) = (self.width as i32, self.height as i32, self.framerate);
+            let supported = caps
+                .iter()
+                .any(|c| c.width == w && c.height == h && c.framerate == fps);
+            if !supported {
+                return Err(anyhow!(
+                    "camera does not support {}x{} @ {}fps; pick a listed mode",
+                    self.width,
+                    self.height,
+                    self.framerate
+                ));
+            }
+        } else if self.width > 7680 || self.height > 4320 {
+            return Err(anyhow!("resolution above 8K is not allowed"));
         }
         Ok(())
     }
@@ -105,14 +127,17 @@ fn capture_encode_head(cfg: &VideoConfig) -> String {
     #[cfg(target_os = "windows")]
     {
         // mfh264enc bitrate is in kbit/s, same unit as VideoConfig::bitrate_kbps.
-        // No explicit source caps: let mfvideosrc negotiate its native format,
-        // then videoconvert normalizes to the requested raw format. `videoscale`
-        // handles the resolution change. `low-latency=true` ~ zerolatency.
+        // Pin the source to a NATIVE camera mode (width/height/framerate the
+        // device actually advertises — validated against probed caps), letting
+        // mfvideosrc choose its native pixel format for that mode. videoconvert
+        // then bridges to the encoder's required input format. No videoscale:
+        // we run the camera's real resolution, not a scaled approximation.
+        // `low-latency=true` ~ zerolatency.
         format!(
             "mfvideosrc ! \
+             video/x-raw,width={w},height={h},framerate={fps}/1 ! \
              videoconvert ! \
-             videoscale ! \
-             video/x-raw,format={fmt},width={w},height={h},framerate={fps}/1 ! \
+             video/x-raw,format={fmt} ! \
              mfh264enc bitrate={br} low-latency=true"
         )
     }
@@ -155,6 +180,31 @@ fn build_pipeline(cfg: &VideoConfig) -> Result<(gst::Pipeline, gst::Element)> {
     Ok((pipeline, tee))
 }
 
+/// Choose a sensible default config from real camera caps: prefer the base
+/// config's resolution+fps if the camera supports it, else the highest-res mode
+/// at the base framerate, else the highest-res mode overall. Keeps the base
+/// format/bitrate (format is encoder-input, not camera-native).
+fn pick_default_config(caps: &[CameraCap], base: &VideoConfig) -> VideoConfig {
+    let (bw, bh, bfps) = (base.width as i32, base.height as i32, base.framerate);
+
+    let exact = caps
+        .iter()
+        .find(|c| c.width == bw && c.height == bh && c.framerate == bfps);
+    let at_fps = || caps.iter().filter(|c| c.framerate == bfps).max_by_key(|c| c.width * c.height);
+    let any = || caps.iter().max_by_key(|c| (c.framerate, c.width * c.height));
+
+    let chosen = exact.or_else(at_fps).or_else(any);
+    match chosen {
+        Some(c) => VideoConfig {
+            width: c.width as u32,
+            height: c.height as u32,
+            framerate: c.framerate,
+            ..base.clone()
+        },
+        None => base.clone(),
+    }
+}
+
 /// The swappable inner state. Held behind a `Mutex` so `reconfigure` can tear
 /// the old pipeline down and stand a new one up while other handlers wait.
 struct Inner {
@@ -165,11 +215,34 @@ struct Inner {
 
 pub struct SharedPipeline {
     inner: Mutex<Inner>,
+    /// Real capture modes probed from the camera at startup. Empty if probing
+    /// found nothing (then `validate` falls back to generic bounds).
+    caps: Vec<CameraCap>,
 }
 
 impl SharedPipeline {
     pub fn new() -> Result<Self> {
-        let config = VideoConfig::default();
+        // Probe the camera that matches our pipeline's source. On Windows the
+        // pipeline uses mfvideosrc, so prefer the mediafoundation device.
+        let prefer_api = if cfg!(target_os = "windows") {
+            Some("mediafoundation")
+        } else {
+            None
+        };
+        let caps = crate::camera::probe_camera(prefer_api).unwrap_or_else(|e| {
+            tracing::warn!("Camera probe failed: {e}; continuing without caps");
+            Vec::new()
+        });
+
+        // Default to a real capture mode when caps are available; otherwise the
+        // static default. Prefer 1080p30, else the highest-res 30fps mode, else
+        // the first listed mode.
+        let mut config = VideoConfig::default();
+        if !caps.is_empty() {
+            config = pick_default_config(&caps, &config);
+        }
+        config.validate(&caps)?;
+
         let (pipeline, tee) = build_pipeline(&config)?;
         Ok(Self {
             inner: Mutex::new(Inner {
@@ -177,7 +250,13 @@ impl SharedPipeline {
                 tee,
                 config,
             }),
+            caps,
         })
+    }
+
+    /// The camera's advertised capture modes (for the client to build dropdowns).
+    pub fn capabilities(&self) -> Vec<CameraCap> {
+        self.caps.clone()
     }
 
     /// Start the capture/encode chain. Runs from server boot until shutdown.
@@ -199,11 +278,21 @@ impl SharedPipeline {
     /// builds the replacement BEFORE tearing down the old one, so a bad config
     /// (e.g. resolution the camera can't deliver) leaves the live stream intact.
     ///
-    /// On success every existing `PeerBranch` is now orphaned (it references the
-    /// old, now-stopped pipeline). The caller must drop all peers and have
-    /// clients reconnect to tap the new pipeline.
-    pub fn reconfigure(&self, new_config: VideoConfig) -> Result<()> {
-        new_config.validate()?;
+    /// Returns `Ok(true)` if the pipeline was rebuilt, `Ok(false)` if the
+    /// requested config is identical to the current one (no-op — we skip the
+    /// expensive teardown/rebuild and existing peers keep streaming).
+    ///
+    /// On a real rebuild every existing `PeerBranch` is now orphaned (it
+    /// references the old, now-stopped pipeline). The caller must drop all peers
+    /// and have clients reconnect to tap the new pipeline.
+    pub fn reconfigure(&self, new_config: VideoConfig) -> Result<bool> {
+        new_config.validate(&self.caps)?;
+
+        // No-op if nothing changed: avoid churning the live pipeline (and
+        // bouncing every connected peer) on an Apply of identical settings.
+        if self.inner.lock().unwrap().config == new_config {
+            return Ok(false);
+        }
 
         // Build + start the replacement first. If this fails, bail without
         // touching the running pipeline.
@@ -223,7 +312,7 @@ impl SharedPipeline {
         );
         // Drop the lock-held old pipeline explicitly to Null.
         let _ = old.pipeline.set_state(gst::State::Null);
-        Ok(())
+        Ok(true)
     }
 
     /// Add a new per-peer branch: `tee -> queue -> webrtcbin`. The `configure`

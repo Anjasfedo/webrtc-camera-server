@@ -119,29 +119,20 @@
     </div>
 
     <div id="config">
+      <!-- Resolution + frame-rate options are populated at runtime from the
+           camera's REAL capabilities (get_capabilities). They start empty. -->
       <label for="cfg-res">Resolution</label>
-      <select id="cfg-res">
-        <option value="3840x2160">3840 x 2160 (4K)</option>
-        <option value="1920x1080" selected>1920 x 1080 (1080p)</option>
-        <option value="1280x720">1280 x 720 (720p)</option>
-        <option value="854x480">854 x 480 (480p)</option>
-        <option value="640x360">640 x 360 (360p)</option>
-      </select>
+      <select id="cfg-res"></select>
 
       <label for="cfg-fps">Frame rate</label>
-      <select id="cfg-fps">
-        <option value="60">60 fps</option>
-        <option value="30" selected>30 fps</option>
-        <option value="25">25 fps</option>
-        <option value="15">15 fps</option>
-      </select>
+      <select id="cfg-fps"></select>
 
       <label for="cfg-bitrate">Bitrate (kbps)</label>
       <input id="cfg-bitrate" type="number" min="100" max="100000" step="100" value="6000" />
 
-      <label for="cfg-format">Raw format</label>
+      <label for="cfg-format">Encoder format</label>
       <select id="cfg-format">
-        <option value="I420" selected>I420</option>
+        <option value="I420">I420</option>
         <option value="NV12">NV12</option>
         <option value="YUY2">YUY2</option>
         <option value="BGRA">BGRA</option>
@@ -172,11 +163,63 @@
       let pc;
       let statsInterval;
       let streaming = false;
+      let caps = []; // real camera capture modes from the server
 
       function log(msg) {
         console.log(msg);
         logEl.textContent += msg + "\n";
         logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      // Distinct resolutions across all capture modes, sorted high-res first.
+      function distinctResolutions() {
+        const seen = new Map(); // "WxH" -> {width, height}
+        for (const c of caps) {
+          seen.set(`${c.width}x${c.height}`, { width: c.width, height: c.height });
+        }
+        return [...seen.values()].sort(
+          (a, b) => b.width * b.height - a.width * a.height,
+        );
+      }
+
+      // Frame rates the camera supports AT a given resolution, descending.
+      function frameRatesFor(width, height) {
+        const set = new Set();
+        for (const c of caps) {
+          if (c.width === width && c.height === height) set.add(c.framerate);
+        }
+        return [...set].sort((a, b) => b - a);
+      }
+
+      // Rebuild the resolution dropdown from caps. Keeps the current selection
+      // if still valid. No-op when caps are empty (probe found nothing).
+      function populateResolutions(selected) {
+        const resolutions = distinctResolutions();
+        cfgRes.innerHTML = "";
+        for (const r of resolutions) {
+          const opt = document.createElement("option");
+          opt.value = `${r.width}x${r.height}`;
+          opt.textContent = `${r.width} x ${r.height}`;
+          cfgRes.appendChild(opt);
+        }
+        if (selected) cfgRes.value = selected;
+        populateFrameRates();
+      }
+
+      // Rebuild the frame-rate dropdown to match the selected resolution.
+      function populateFrameRates(selected) {
+        const [width, height] = cfgRes.value.split("x").map(Number);
+        const rates = frameRatesFor(width, height);
+        cfgFps.innerHTML = "";
+        for (const fps of rates) {
+          const opt = document.createElement("option");
+          opt.value = String(fps);
+          opt.textContent = `${fps} fps`;
+          cfgFps.appendChild(opt);
+        }
+        if (selected && rates.includes(Number(selected))) {
+          cfgFps.value = String(selected);
+        }
       }
 
       // Read the form into a VideoConfig matching the server's serde shape.
@@ -191,10 +234,18 @@
         };
       }
 
-      // Push a server config back into the form controls.
+      // Push a server config back into the form controls. Ensures the option
+      // exists (caps may not have arrived yet) before selecting it.
       function applyConfigToForm(cfg) {
-        cfgRes.value = `${cfg.width}x${cfg.height}`;
-        cfgFps.value = String(cfg.framerate);
+        const resVal = `${cfg.width}x${cfg.height}`;
+        if (![...cfgRes.options].some((o) => o.value === resVal)) {
+          const opt = document.createElement("option");
+          opt.value = resVal;
+          opt.textContent = `${cfg.width} x ${cfg.height}`;
+          cfgRes.appendChild(opt);
+        }
+        cfgRes.value = resVal;
+        populateFrameRates(cfg.framerate);
         cfgBitrate.value = String(cfg.bitrate_kbps);
         cfgFormat.value = cfg.format;
       }
@@ -315,7 +366,8 @@
 
         ws.onopen = () => {
           log("WS open");
-          send({ type: "get_config" }); // sync the form to the live config
+          send({ type: "get_capabilities" }); // real camera modes for the form
+          send({ type: "get_config" }); // then sync to the live config
           if (streaming) startPeer();
         };
 
@@ -345,14 +397,23 @@
             } catch (e) {
               log("addIceCandidate failed: " + e);
             }
+          } else if (msg.type === "capabilities") {
+            caps = msg.caps || [];
+            log(`Camera modes: ${caps.length}`);
+            const current = cfgRes.value || null;
+            populateResolutions(current);
           } else if (msg.type === "config") {
             applyConfigToForm(msg.config);
             log("Config: " + JSON.stringify(msg.config));
           } else if (msg.type === "reconfigured") {
-            // Server rebuilt the pipeline; our old branch is gone. Reconnect
-            // the peer if we were streaming.
-            log("Server reconfigured; reconnecting peer");
-            if (streaming) startPeer();
+            // Server rebuilt the pipeline; our old branch (if any) is gone.
+            // Only reconnect if we were actually streaming.
+            if (streaming) {
+              log("Server reconfigured; reconnecting peer");
+              startPeer();
+            } else {
+              log("Server reconfigured (not streaming)");
+            }
           } else if (msg.type === "error") {
             log("Server error: " + msg.message);
             alert(msg.message);
@@ -371,6 +432,10 @@
         streaming = true;
         startPeer();
       });
+
+      // When the resolution changes, refresh the frame-rate list to only the
+      // rates the camera supports at that resolution.
+      cfgRes.addEventListener("change", () => populateFrameRates());
 
       applyBtn.addEventListener("click", () => {
         const config = readConfig();

@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
+use crate::camera::CameraCap;
 use crate::peer::Peer;
 use crate::pipeline::{SharedPipeline, VideoConfig};
 
@@ -54,6 +55,12 @@ pub enum SignalingMessage {
     /// Server's reply to `GetConfig`, also sent after a successful `SetConfig`.
     Config {
         config: VideoConfig,
+    },
+    /// Client asks what capture modes the real camera supports.
+    GetCapabilities,
+    /// Server's reply to `GetCapabilities`: the probed camera capture modes.
+    Capabilities {
+        caps: Vec<CameraCap>,
     },
     /// Client requests new video params; triggers a live pipeline rebuild.
     SetConfig {
@@ -154,12 +161,17 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 let config = state.pipeline.config();
                 let _ = outbound_tx.send(SignalingMessage::Config { config });
             }
+            SignalingMessage::GetCapabilities => {
+                let caps = state.pipeline.capabilities();
+                let _ = outbound_tx.send(SignalingMessage::Capabilities { caps });
+            }
             SignalingMessage::SetConfig { config } => {
                 info!("Reconfigure requested: {config:?}");
                 match state.pipeline.reconfigure(config) {
-                    Ok(()) => {
-                        // This peer's branch is now orphaned; drop it so the
-                        // client gets a clean reconnect via the broadcast below.
+                    Ok(true) => {
+                        // Pipeline rebuilt: this peer's branch is now orphaned;
+                        // drop it so the client gets a clean reconnect via the
+                        // broadcast below.
                         peer = None;
                         let new_config = state.pipeline.config();
                         let _ = outbound_tx.send(SignalingMessage::Config {
@@ -168,6 +180,15 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                         // Tell every client (including this one) to reconnect.
                         let _ = state.reconfigured_tx.send(());
                         info!("Pipeline reconfigured");
+                    }
+                    Ok(false) => {
+                        // No change requested; pipeline untouched, peers keep
+                        // streaming. Just echo the current config back.
+                        let new_config = state.pipeline.config();
+                        let _ = outbound_tx.send(SignalingMessage::Config {
+                            config: new_config,
+                        });
+                        info!("Reconfigure skipped: config unchanged");
                     }
                     Err(e) => {
                         error!("Reconfigure failed: {e:?}");
@@ -181,6 +202,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 warn!("Received unexpected `offer` from client; ignoring");
             }
             SignalingMessage::Config { .. }
+            | SignalingMessage::Capabilities { .. }
             | SignalingMessage::Reconfigured
             | SignalingMessage::Error { .. } => {
                 warn!("Received server-only message from client; ignoring");

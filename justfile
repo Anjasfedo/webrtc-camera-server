@@ -30,6 +30,11 @@ run:
 up:
     docker run -d --rm --name {{container}} -p {{port}}:{{port}} {{image}}
 
+# Run with the synthetic videotestsrc source (no camera needed). Boots fully on
+# Windows Docker — open http://localhost:8090 and Start to see the test pattern.
+run-test:
+    docker run --rm --name {{container}} -p {{port}}:{{port}} -e WCS_TEST_SOURCE=1 {{image}}
+
 # Tail container logs.
 logs:
     docker logs -f {{container}}
@@ -47,25 +52,6 @@ clean: rm
     -docker rmi {{image}}
 
 # Smoke test: build + boot the container, confirm GStreamer + plugins load.
+# (Windows has no camera, so a v4l2 pipeline failure still counts as PASS.)
 test: build
-    #!powershell.exe -NoLogo -Command
-    Write-Host "Starting container..."
-    docker run -d --rm --name {{container}}-test {{image}} | Out-Null
-    Start-Sleep -Seconds 8
-    $log = docker logs {{container}}-test 2>&1 | Out-String
-    docker rm -f {{container}}-test 2>$null | Out-Null
-    Write-Host "--- container log ---"
-    Write-Host $log
-    Write-Host "---------------------"
-    if ($log -match "GStreamer initialized") {
-        if ($log -match "camera is live") {
-            Write-Host "PASS: server booted AND camera is live (Linux host with camera)."
-        } elseif ($log -match "v4l2|/dev/video0|shared pipeline|Failed to build") {
-            Write-Host "PASS: image OK. GStreamer loaded; pipeline failed on the missing camera (expected on Windows)."
-        } else {
-            Write-Host "PASS: GStreamer loaded. (No camera-related outcome detected.)"
-        }
-    } else {
-        Write-Host "FAIL: GStreamer did not initialize — image or plugins broken."
-        exit 1
-    }
+    powershell.exe -NoProfile -ExecutionPolicy Bypass -File scripts/smoke-test.ps1 -Image {{image}}

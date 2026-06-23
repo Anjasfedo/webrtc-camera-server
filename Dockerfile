@@ -56,6 +56,10 @@ WORKDIR /app
 COPY --from=builder /app/target/release/webrtc-camera-server /usr/local/bin/
 COPY templates ./templates
 
+# The server writes JSONL logs to ./logs at runtime. Create it and hand /app to
+# the non-root user so it can write there (and rotate daily) without root.
+RUN mkdir -p /app/logs && chown -R app:app /app
+
 USER app
 
 ENV WCS_BIND=0.0.0.0 \

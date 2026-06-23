@@ -36,6 +36,7 @@ exits immediately.
 | `WCS_STUN`            | `stun://stun.l.google.com:19302` | STUN server for `webrtcbin`    |
 | `WCS_EMULATOR_LAN_IP` | (unset → workaround off)         | Android-emulator ICE rewrite   |
 | `WCS_STATIC_DIR`      | `templates`                      | static file dir                |
+| `WCS_TEST_SOURCE`     | `0`                              | `1` → `videotestsrc`, no camera|
 | `RUST_LOG`            | `webrtc_camera_server=info,...`  | log filter                     |
 
 A present-but-unparseable value (e.g. non-numeric `WCS_PORT`) fails fast at
@@ -56,6 +57,8 @@ docker build -t webrtc-camera-server .
 docker run --rm -p 8090:8090 --device /dev/video0 --group-add video webrtc-camera-server
 # or:
 docker compose up --build
+# No camera (any host, incl. Docker Desktop on Windows/Mac) — synthetic source:
+docker run --rm -p 8090:8090 -e WCS_TEST_SOURCE=1 webrtc-camera-server
 ```
 
 Camera passthrough (`--device /dev/video0`, `--group-add video`) needs a **Linux
@@ -63,6 +66,16 @@ Docker host** — it does not work on Docker Desktop for Windows/Mac (no
 `/dev/videoN`). Build the image anywhere; run it where the camera is. The image
 runs as non-root (uid 10001, in the `video` group). `getent group video` on the
 host to confirm the gid if `--group-add video` by name doesn't resolve.
+
+**No-camera testing**: set `WCS_TEST_SOURCE=1` to swap the camera for GStreamer's
+`videotestsrc` (synthetic moving bars). The server then boots fully on ANY host
+(including Docker Desktop on Windows) — health endpoints, WS signaling, and the
+web client all work end-to-end with a test pattern. Camera probing is skipped, so
+the device dropdown is empty and `validate` falls back to generic bounds.
+
+A `justfile` wraps the Docker workflow: `just build`, `just run` (real camera),
+`just run-test` (videotestsrc), `just up`, `just logs`, `just stop`, `just clean`,
+and `just test` (builds + boots with the test source + probes `/healthz`).
 
 ## Architecture
 
@@ -172,12 +185,14 @@ browsers: drop peer, reconnect with {type:start}
 
 ## Gotchas
 
-- **Platform-specific capture head**: `pipeline.rs::capture_encode_head` is
-  `#[cfg]`-split — Linux `v4l2src` (MJPEG) → `jpegdec` → `x264enc`; Windows
-  `mfvideosrc` (pinned to a native res@fps) → `videoconvert` → `mfh264enc`. Edit
-  there to change source/encoder; the parse/pay/tee tail is shared in
-  `build_pipeline`. There is NO `videoscale` — the camera runs its real
-  resolution (validated against probed caps), not a scaled approximation.
+- **Capture head**: `pipeline.rs::capture_encode_head` picks the source then
+  appends the platform encoder. Source: `camera_source` (real camera) or, when
+  `test_source`, `videotestsrc`. Encoder (`encoder()`) is `#[cfg]`-split — Linux
+  `x264enc`, Windows `mfh264enc`. Real camera head: Linux `v4l2src` (MJPEG) →
+  `jpegdec` → `videoconvert`; Windows `mfvideosrc` (pinned to a native res@fps) →
+  `videoconvert`. The parse/pay/tee tail is shared in `build_pipeline`. There is
+  NO `videoscale` — the camera runs its real resolution (validated against probed
+  caps), not a scaled approximation.
 
 - **mfh264enc only accepts NV12**: on Windows the MF H.264 encoder rejects
   `I420`/`BGRA` raw caps — it links only against `NV12`. `VideoConfig::default`

@@ -12,6 +12,7 @@
 //! | `WCS_STUN`               | `stun://stun.l.google.com:19302` |
 //! | `WCS_EMULATOR_LAN_IP`    | (unset — workaround disabled)    |
 //! | `WCS_STATIC_DIR`         | `templates`                      |
+//! | `WCS_TEST_SOURCE`        | `0` (use real camera)            |
 //! | `RUST_LOG`               | `webrtc_camera_server=info,...`  |
 
 use std::net::IpAddr;
@@ -32,6 +33,9 @@ pub struct Config {
     pub emulator_lan_ip: Option<String>,
     /// Directory served as static files (the test client).
     pub static_dir: String,
+    /// Use a synthetic `videotestsrc` instead of a real camera. Lets the server
+    /// run with no camera (e.g. in a container on a host without `/dev/videoN`).
+    pub test_source: bool,
 }
 
 impl Config {
@@ -63,12 +67,18 @@ impl Config {
 
         let static_dir = std::env::var("WCS_STATIC_DIR").unwrap_or_else(|_| "templates".to_string());
 
+        // Truthy values enable the synthetic source.
+        let test_source = std::env::var("WCS_TEST_SOURCE")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes" | "on"))
+            .unwrap_or(false);
+
         Ok(Self {
             bind,
             port,
             stun_server,
             emulator_lan_ip,
             static_dir,
+            test_source,
         })
     }
 }

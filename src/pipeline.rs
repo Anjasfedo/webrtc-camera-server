@@ -115,12 +115,15 @@ impl VideoConfig {
     }
 }
 
-/// Platform-specific capture + H.264-encode chain, ending right before
-/// `h264parse`. The rest of the pipeline (parse, payload, tee) is shared.
+/// Capture + H.264-encode chain, ending right before `h264parse`. The rest of
+/// the pipeline (parse, payload, tee) is shared.
 ///
-/// Linux: V4L2 camera delivering MJPEG, software-encoded with x264.
-/// Windows: Media Foundation camera, hardware-encoded with mfh264enc.
-fn capture_encode_head(cfg: &VideoConfig) -> String {
+/// With `test_source`, a synthetic `videotestsrc` replaces the camera (no
+/// `/dev/videoN` / camera needed — for containers or camera-less hosts). The
+/// encoder is platform-specific either way:
+///   Linux:   ... -> x264enc        (software)
+///   Windows: ... -> mfh264enc      (Media Foundation)
+fn capture_encode_head(cfg: &VideoConfig, test_source: bool) -> String {
     let (w, h, fps, br, fmt) = (
         cfg.width,
         cfg.height,
@@ -129,28 +132,44 @@ fn capture_encode_head(cfg: &VideoConfig) -> String {
         &cfg.format,
     );
 
+    // Source -> raw caps at the requested format/res/fps, ready for the encoder.
+    let source = if test_source {
+        // `is-live=true` makes videotestsrc behave like a real capture device
+        // (timestamps, backpressure) so webrtcbin negotiates the same way.
+        format!(
+            "videotestsrc is-live=true ! \
+             video/x-raw,format={fmt},width={w},height={h},framerate={fps}/1 ! \
+             videoconvert ! \
+             video/x-raw,format={fmt}"
+        )
+    } else {
+        camera_source(cfg, w, h, fps, fmt)
+    };
+
+    format!("{source} ! {}", encoder(br))
+}
+
+/// The real camera source, platform-specific, ending in the encoder input caps.
+fn camera_source(cfg: &VideoConfig, w: u32, h: u32, fps: u32, fmt: &str) -> String {
+    let _ = cfg; // device_id unused on platforms without a device selector
+
     #[cfg(target_os = "windows")]
     {
-        // mfh264enc bitrate is in kbit/s, same unit as VideoConfig::bitrate_kbps.
-        // Pin the source to a NATIVE camera mode (width/height/framerate the
-        // device actually advertises — validated against probed caps), letting
-        // mfvideosrc choose its native pixel format for that mode. videoconvert
-        // then bridges to the encoder's required input format. No videoscale:
-        // we run the camera's real resolution, not a scaled approximation.
-        // `low-latency=true` ~ zerolatency.
+        // Pin the source to a NATIVE camera mode (validated against probed caps),
+        // letting mfvideosrc choose its native pixel format; videoconvert then
+        // bridges to the encoder's required input format. No videoscale.
         let device = device_path_arg(cfg.device_id.as_deref());
         format!(
             "mfvideosrc{device} ! \
              video/x-raw,width={w},height={h},framerate={fps}/1 ! \
              videoconvert ! \
-             video/x-raw,format={fmt} ! \
-             mfh264enc bitrate={br} low-latency=true"
+             video/x-raw,format={fmt}"
         )
     }
 
     #[cfg(not(target_os = "windows"))]
     {
-        // x264enc bitrate is in kbit/s. On v4l2 the device id is the /dev path.
+        // On v4l2 the device id is the /dev path.
         let device = cfg
             .device_id
             .as_deref()
@@ -161,9 +180,20 @@ fn capture_encode_head(cfg: &VideoConfig) -> String {
              image/jpeg,width={w},height={h},framerate={fps}/1 ! \
              jpegdec ! \
              videoconvert ! \
-             video/x-raw,format={fmt} ! \
-             x264enc bitrate={br} tune=zerolatency speed-preset=ultrafast"
+             video/x-raw,format={fmt}"
         )
+    }
+}
+
+/// The platform-specific H.264 encoder. `bitrate` is kbit/s on both encoders.
+fn encoder(bitrate: u32) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        format!("mfh264enc bitrate={bitrate} low-latency=true")
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        format!("x264enc bitrate={bitrate} tune=zerolatency speed-preset=ultrafast")
     }
 }
 
@@ -184,14 +214,14 @@ fn device_path_arg(device_id: Option<&str>) -> String {
 
 /// Build a fully-formed (capture -> encode -> parse -> pay -> tee) pipeline for
 /// the given config, returning the pipeline and its tee element.
-fn build_pipeline(cfg: &VideoConfig) -> Result<(gst::Pipeline, gst::Element)> {
+fn build_pipeline(cfg: &VideoConfig, test_source: bool) -> Result<(gst::Pipeline, gst::Element)> {
     let pipeline_str = format!(
         "{head} ! \
          h264parse config-interval=-1 ! \
          rtph264pay pt=96 mtu=1200 aggregate-mode=zero-latency ! \
          application/x-rtp,media=video,encoding-name=H264,payload=96 ! \
          tee name=videotee allow-not-linked=true",
-        head = capture_encode_head(cfg),
+        head = capture_encode_head(cfg, test_source),
     );
 
     let pipeline = gst::parse::launch(&pipeline_str)
@@ -257,25 +287,34 @@ pub struct SharedPipeline {
     /// All connected cameras + their real capture modes, probed at startup.
     /// Empty if probing found nothing (then `validate` falls back to bounds).
     devices: Vec<CameraDevice>,
+    /// Synthetic-source mode: skip the camera, use `videotestsrc`.
+    test_source: bool,
 }
 
 impl SharedPipeline {
-    pub fn new() -> Result<Self> {
-        // Probe cameras that match our pipeline's source. On Windows the
-        // pipeline uses mfvideosrc, so list only mediafoundation devices.
-        let only_api = if cfg!(target_os = "windows") {
-            Some("mediafoundation")
-        } else {
-            None
-        };
-        let devices = crate::camera::probe_cameras(only_api).unwrap_or_else(|e| {
-            tracing::warn!("Camera probe failed: {e}; continuing without devices");
+    pub fn new(test_source: bool) -> Result<Self> {
+        // In test-source mode there is no camera to probe — skip enumeration and
+        // run the static default config through `videotestsrc`.
+        let devices = if test_source {
+            tracing::info!("Test source enabled (videotestsrc); skipping camera probe");
             Vec::new()
-        });
+        } else {
+            // On Windows the pipeline uses mfvideosrc, so list only the
+            // mediafoundation devices.
+            let only_api = if cfg!(target_os = "windows") {
+                Some("mediafoundation")
+            } else {
+                None
+            };
+            crate::camera::probe_cameras(only_api).unwrap_or_else(|e| {
+                tracing::warn!("Camera probe failed: {e}; continuing without devices");
+                Vec::new()
+            })
+        };
 
         // Default to the first device and one of its real capture modes (prefer
         // 1080p30, else highest-res at 30fps, else highest-res). Fall back to
-        // the static config when no device was found.
+        // the static config when no device was found / in test mode.
         let mut config = VideoConfig::default();
         if let Some(first) = devices.first() {
             config.device_id = Some(first.id.clone()).filter(|s| !s.is_empty());
@@ -285,7 +324,7 @@ impl SharedPipeline {
         }
         config.validate(caps_for(&devices, config.device_id.as_deref()))?;
 
-        let (pipeline, tee) = build_pipeline(&config)?;
+        let (pipeline, tee) = build_pipeline(&config, test_source)?;
         Ok(Self {
             inner: Mutex::new(Inner {
                 pipeline,
@@ -293,6 +332,7 @@ impl SharedPipeline {
                 config,
             }),
             devices,
+            test_source,
         })
     }
 
@@ -352,7 +392,7 @@ impl SharedPipeline {
 
         // Build + start the replacement first. If this fails, bail without
         // touching the running pipeline.
-        let (new_pipeline, new_tee) = build_pipeline(&new_config)?;
+        let (new_pipeline, new_tee) = build_pipeline(&new_config, self.test_source)?;
         new_pipeline
             .set_state(gst::State::Playing)
             .context("Failed to start reconfigured pipeline")?;

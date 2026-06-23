@@ -47,7 +47,7 @@ async fn main() -> Result<()> {
 
     // Build and start the shared capture + encode pipeline. From here on the
     // camera is on and the encoder is running. New WebRTC clients tap in.
-    let pipeline = SharedPipeline::new()?;
+    let pipeline = SharedPipeline::new(cfg.test_source)?;
     pipeline.start()?;
     info!("Shared pipeline running; camera is live");
 

@@ -316,6 +316,14 @@ impl SharedPipeline {
         self.inner.lock().unwrap().config.clone()
     }
 
+    /// Whether the shared pipeline is currently in the Playing state (used by
+    /// the readiness probe). A short timeout avoids blocking on a state change.
+    pub fn is_playing(&self) -> bool {
+        let inner = self.inner.lock().unwrap();
+        let (_, current, _) = inner.pipeline.state(gst::ClockTime::from_mseconds(0));
+        current == gst::State::Playing
+    }
+
     /// Rebuild the shared pipeline with new video params. Validates first, then
     /// builds the replacement BEFORE tearing down the old one, so a bad config
     /// (e.g. resolution the camera can't deliver) leaves the live stream intact.
@@ -365,8 +373,13 @@ impl SharedPipeline {
 
     /// Add a new per-peer branch: `tee -> queue -> webrtcbin`. The `configure`
     /// closure runs after the branch is in the pipeline but before data flows,
-    /// which is the right place to connect webrtcbin signal handlers.
-    pub fn attach_peer(&self, configure: impl FnOnce(&gst::Element)) -> Result<PeerBranch> {
+    /// which is the right place to connect webrtcbin signal handlers. `stun` is
+    /// the STUN server URI for this peer's `webrtcbin`.
+    pub fn attach_peer(
+        &self,
+        stun: &str,
+        configure: impl FnOnce(&gst::Element),
+    ) -> Result<PeerBranch> {
         let inner = self.inner.lock().unwrap();
         let pipeline = inner.pipeline.clone();
         let tee = inner.tee.clone();
@@ -386,7 +399,7 @@ impl SharedPipeline {
 
         let webrtcbin = gst::ElementFactory::make("webrtcbin")
             .property_from_str("bundle-policy", "max-bundle")
-            .property("stun-server", "stun://stun.l.google.com:19302")
+            .property("stun-server", stun)
             .build()
             .context("Failed to create webrtcbin")?;
 

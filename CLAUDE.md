@@ -11,23 +11,44 @@ continuously from server boot; clients tap into the live stream on connect.
 ## Commands
 
 ```bash
-cargo run                 # build + run server, listens on 0.0.0.0:8080
+cargo run                 # build + run server, listens on 0.0.0.0:8090
 cargo build --release     # optimized build (LTO thin, codegen-units=1)
 cargo check               # fast type-check
 RUST_LOG=webrtc_camera_server=debug cargo run   # verbose logging (default is info)
+WCS_PORT=9000 cargo run                          # override config via env (see config.rs)
 ```
 
-No tests exist. Manual testing: run the server, open `http://localhost:8080`
-(served from `test-client/`), click **Start Stream**.
+No tests exist. Manual testing: run the server, open `http://localhost:8090`
+(served from `templates/`), click **Start Stream**. Health probes:
+`GET /healthz` (liveness, always 200) and `GET /readyz` (200 when the pipeline
+is live, else 503).
 
 GStreamer must be installed on the host (with the plugins for the configured
 source/encoder) and `gstreamer::init()` must succeed at startup, or the server
 exits immediately.
 
+### Configuration (env vars, all optional — see `config.rs`)
+
+| Env var               | Default                          | Purpose                        |
+|-----------------------|----------------------------------|--------------------------------|
+| `WCS_BIND`            | `0.0.0.0`                        | bind address                   |
+| `WCS_PORT`            | `8090`                           | listen port                    |
+| `WCS_STUN`            | `stun://stun.l.google.com:19302` | STUN server for `webrtcbin`    |
+| `WCS_EMULATOR_LAN_IP` | (unset → workaround off)         | Android-emulator ICE rewrite   |
+| `WCS_STATIC_DIR`      | `templates`                      | static file dir                |
+| `RUST_LOG`            | `webrtc_camera_server=info,...`  | log filter                     |
+
+A present-but-unparseable value (e.g. non-numeric `WCS_PORT`) fails fast at
+startup rather than being silently ignored.
+
 ## Architecture
 
 The core idea is **one shared pipeline, N dynamic per-peer branches**. This
 avoids re-capturing/re-encoding per client.
+
+- `config.rs` — `Config::from_env()` reads all runtime config (bind/port/STUN/
+  emulator LAN IP/static dir) from env vars with defaults; lives in `AppState`.
+  Parse errors fail fast at startup.
 
 - `camera.rs` — `probe_cameras(only_api)` enumerates ALL connected cameras via
   `GstDeviceMonitor` (`Video/Source` class), keeping only those whose
@@ -88,10 +109,15 @@ avoids re-capturing/re-encoding per client.
   it stops the background writer and loses buffered lines. Filter via `RUST_LOG`
   (default `webrtc_camera_server=info,tower_http=info`). `logs/` is gitignored.
 
-- `main.rs` — call `logging::init()` (hold the returned guard), init GStreamer,
-  build+start the shared pipeline, wrap it in `AppState`, mount the Axum router
-  (`/ws` + static `templates/`, permissive CORS), and spawn a background task
-  that logs this process's CPU/RAM/thread count every 5s via `sysinfo`.
+- `main.rs` — call `logging::init()` (hold the returned guard), load `Config`,
+  init GStreamer, build+start the shared pipeline, wrap it + config in
+  `AppState`, mount the Axum router (`/ws` + `/healthz` + `/readyz` + static dir,
+  permissive CORS), and spawn `metrics_loop` (CPU/RAM/threads every 5s via
+  `sysinfo`). `axum::serve(...).with_graceful_shutdown(shutdown_signal())` serves
+  until SIGTERM (Unix) / Ctrl-C, then drains and exits cleanly — dropping
+  `AppState` nulls the pipeline (its `Drop`), and `_log_guard` flushes. Startup
+  no longer panics: the PID fetch and signal-handler installs are handled, not
+  `.expect()`ed.
 
 - `templates/index.html` — self-contained browser client (no build step). On
   load it opens the WS, requests `get_devices` (to build the camera + resolution
@@ -137,10 +163,11 @@ browsers: drop peer, reconnect with {type:start}
   one of those on Windows makes `reconfigure` fail (server replies `error`, live
   stream untouched) — don't widen the allowed list without a per-platform guard.
 
-- **Hardcoded LAN IP**: `peer.rs::emulator_aliases` rewrites the server's LAN IP
-  (`192.168.1.103`) to `10.0.2.2` so an Android emulator peer can route to the
-  host. This is a hardcoded constant — update it on network change, or it
-  silently does nothing.
+- **Emulator LAN-IP workaround** (`peer.rs::emulator_aliases`): when
+  `WCS_EMULATOR_LAN_IP` is set, ICE candidates containing that IP are duplicated
+  with it rewritten to `10.0.2.2` (the qemu host alias) so an Android emulator
+  peer can route to the host. Unset by default → disabled (no rewrite). It is no
+  longer a hardcoded constant; set the env var to your dev box's LAN IP to use it.
 
 - **Video params** live in `VideoConfig` (`pipeline.rs`). The default mode is
   chosen from real caps at boot (`pick_default_config`, prefers 1080p30).

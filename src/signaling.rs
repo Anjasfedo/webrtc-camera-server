@@ -15,22 +15,25 @@ use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::camera::CameraDevice;
+use crate::config::Config;
 use crate::peer::Peer;
 use crate::pipeline::{SharedPipeline, VideoConfig};
 
 /// Shared application state handed to every WebSocket connection.
 pub struct AppState {
     pub pipeline: SharedPipeline,
+    pub config: Config,
     /// Fires whenever the pipeline is reconfigured, so every connected client
     /// can be told to tear down and reconnect to the rebuilt pipeline.
     pub reconfigured_tx: broadcast::Sender<()>,
 }
 
 impl AppState {
-    pub fn new(pipeline: SharedPipeline) -> Self {
+    pub fn new(pipeline: SharedPipeline, config: Config) -> Self {
         let (reconfigured_tx, _) = broadcast::channel(16);
         Self {
             pipeline,
+            config,
             reconfigured_tx,
         }
     }
@@ -130,7 +133,12 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
 
         match msg {
             SignalingMessage::Start => {
-                match Peer::new(&state.pipeline, outbound_tx.clone()) {
+                match Peer::new(
+                    &state.pipeline,
+                    &state.config.stun_server,
+                    state.config.emulator_lan_ip.clone(),
+                    outbound_tx.clone(),
+                ) {
                     Ok(p) => {
                         info!("Peer branch attached to shared pipeline");
                         peer = Some(p);

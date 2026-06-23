@@ -12,6 +12,7 @@ use tower_http::{cors::CorsLayer, services::ServeDir};
 use tracing::info;
 
 mod camera;
+mod logging;
 mod peer;
 mod pipeline;
 mod signaling;
@@ -21,12 +22,9 @@ use crate::signaling::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "webrtc_camera_server=info,tower_http=info".into()),
-        )
-        .init();
+    // Hold the guard until main returns so the background log writer keeps
+    // flushing. Dropping it early would silence/lose buffered log lines.
+    let _log_guard = logging::init()?;
 
     gstreamer::init()?;
     info!(

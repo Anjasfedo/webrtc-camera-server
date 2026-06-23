@@ -80,10 +80,18 @@ avoids re-capturing/re-encoding per client.
   **The server is the offerer**; the browser answers. `handle_answer` /
   `handle_ice_candidate` apply the browser's responses to webrtcbin.
 
-- `main.rs` — init tracing + GStreamer, build+start the shared pipeline, wrap it
-  in `AppState`, mount the Axum router (`/ws` + static `templates/`, permissive
-  CORS), and spawn a background task that logs this process's CPU/RAM/thread
-  count every 5s via `sysinfo`.
+- `logging.rs` — `init()` sets up the global `tracing` subscriber to write
+  **JSONL** (one JSON object per line) to `logs/server.<YYYY-MM-DD>.jsonl`,
+  rotated DAILY at UTC midnight (`tracing-appender`). Console is intentionally
+  quiet (file-only); a single `println!` at startup points to the log dir. It
+  returns a `WorkerGuard` that `main` MUST keep alive (`_log_guard`) — dropping
+  it stops the background writer and loses buffered lines. Filter via `RUST_LOG`
+  (default `webrtc_camera_server=info,tower_http=info`). `logs/` is gitignored.
+
+- `main.rs` — call `logging::init()` (hold the returned guard), init GStreamer,
+  build+start the shared pipeline, wrap it in `AppState`, mount the Axum router
+  (`/ws` + static `templates/`, permissive CORS), and spawn a background task
+  that logs this process's CPU/RAM/thread count every 5s via `sysinfo`.
 
 - `templates/index.html` — self-contained browser client (no build step). On
   load it opens the WS, requests `get_devices` (to build the camera + resolution

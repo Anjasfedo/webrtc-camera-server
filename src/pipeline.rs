@@ -3,12 +3,16 @@
 //! One capture + encode chain runs from server boot. A `tee` element fans
 //! the encoded RTP stream out to one `webrtcbin` per connected client.
 //!
-//!   mfvideosrc -> videoconvert -> mfh264enc -> h264parse -> rtph264pay -> tee
-//!                                                                          |
-//!                                              +----------+----------------+
-//!                                              v          v
-//!                                       queue+webrtc  queue+webrtc   ...
-//!                                       (peer 1)      (peer 2)
+//!   <capture+encode head> -> h264parse -> rtph264pay -> tee
+//!                                                         |
+//!                            +----------+-----------------+
+//!                            v          v
+//!                     queue+webrtc  queue+webrtc   ...
+//!                     (peer 1)      (peer 2)
+//!
+//! The capture+encode head is platform-specific (see `capture_encode_head`):
+//!   Linux:   v4l2src (MJPEG) -> jpegdec -> videoconvert -> x264enc
+//!   Windows: mfvideosrc -> videoconvert -> videoscale -> mfh264enc
 
 use anyhow::{Context, Result, anyhow};
 use gstreamer as gst;
@@ -19,6 +23,49 @@ pub const VIDEO_HEIGHT: u32 = 1080;
 pub const VIDEO_FRAMERATE: u32 = 30;
 pub const VIDEO_BITRATE_KBPS: u32 = 6000;
 
+/// Platform-specific capture + H.264-encode chain, ending right before
+/// `h264parse`. The rest of the pipeline (parse, payload, tee) is shared.
+///
+/// Linux: V4L2 camera delivering MJPEG, software-encoded with x264.
+/// Windows: Media Foundation camera, hardware-encoded with mfh264enc.
+fn capture_encode_head() -> String {
+    #[cfg(target_os = "windows")]
+    {
+        // mfh264enc bitrate is in kbit/s, same unit as VIDEO_BITRATE_KBPS.
+        // No explicit source caps: let mfvideosrc negotiate its native format,
+        // then videoconvert normalizes to what the encoder accepts. Add
+        // `low-latency=true` for zerolatency-equivalent behavior.
+        format!(
+            "mfvideosrc ! \
+             videoconvert ! \
+             videoscale ! \
+             video/x-raw,width={w},height={h},framerate={fps}/1 ! \
+             mfh264enc bitrate={br} low-latency=true",
+            w = VIDEO_WIDTH,
+            h = VIDEO_HEIGHT,
+            fps = VIDEO_FRAMERATE,
+            br = VIDEO_BITRATE_KBPS,
+        )
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    {
+        // x264enc bitrate is in kbit/s.
+        format!(
+            "v4l2src device=/dev/video0 ! \
+             image/jpeg,width={w},height={h},framerate={fps}/1 ! \
+             jpegdec ! \
+             videoconvert ! \
+             video/x-raw,format=I420 ! \
+             x264enc bitrate={br} tune=zerolatency speed-preset=ultrafast",
+            w = VIDEO_WIDTH,
+            h = VIDEO_HEIGHT,
+            fps = VIDEO_FRAMERATE,
+            br = VIDEO_BITRATE_KBPS,
+        )
+    }
+}
+
 pub struct SharedPipeline {
     pipeline: gst::Pipeline,
     tee: gst::Element,
@@ -26,21 +73,15 @@ pub struct SharedPipeline {
 
 impl SharedPipeline {
     pub fn new() -> Result<Self> {
+        // Capture + encode head is platform-specific; the payload + tee tail is
+        // shared. See `capture_encode_head` for the per-OS element choice.
         let pipeline_str = format!(
-            "v4l2src device=/dev/video0 ! \
-             image/jpeg,width={w},height={h},framerate={fps}/1 ! \
-             jpegdec ! \
-             videoconvert ! \
-             video/x-raw,format=I420 ! \
-             x264enc bitrate={br} tune=zerolatency speed-preset=ultrafast ! \
+            "{head} ! \
              h264parse config-interval=-1 ! \
              rtph264pay pt=96 mtu=1200 aggregate-mode=zero-latency ! \
              application/x-rtp,media=video,encoding-name=H264,payload=96 ! \
              tee name=videotee allow-not-linked=true",
-            w = VIDEO_WIDTH,
-            h = VIDEO_HEIGHT,
-            fps = VIDEO_FRAMERATE,
-            br = VIDEO_BITRATE_KBPS,
+            head = capture_encode_head(),
         );
 
         let pipeline = gst::parse::launch(&pipeline_str)

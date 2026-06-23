@@ -44,7 +44,7 @@ async fn main() -> Result<()> {
         .fallback_service(ServeDir::new("test-client"))
         .layer(CorsLayer::permissive());
 
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8080));
+    let addr = SocketAddr::from(([0, 0, 0, 0], 8090));
 
     tokio::spawn(async move {
         let mut sys = System::new_all();

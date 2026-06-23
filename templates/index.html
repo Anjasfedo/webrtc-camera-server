@@ -63,6 +63,34 @@
         overflow-y: auto;
         white-space: pre-wrap;
       }
+      #config {
+        background: #1a1a1d;
+        padding: 16px;
+        margin-top: 16px;
+        border-radius: 8px;
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 10px 14px;
+        align-items: center;
+        max-width: 420px;
+      }
+      #config label {
+        color: #aaa;
+        font-size: 14px;
+      }
+      #config select,
+      #config input {
+        background: #111;
+        color: #eee;
+        border: 1px solid #333;
+        border-radius: 4px;
+        padding: 6px 8px;
+        font-size: 14px;
+        width: 100%;
+      }
+      #config .full {
+        grid-column: 1 / -1;
+      }
     </style>
   </head>
   <body>
@@ -90,6 +118,38 @@
       </div>
     </div>
 
+    <div id="config">
+      <label for="cfg-res">Resolution</label>
+      <select id="cfg-res">
+        <option value="3840x2160">3840 x 2160 (4K)</option>
+        <option value="1920x1080" selected>1920 x 1080 (1080p)</option>
+        <option value="1280x720">1280 x 720 (720p)</option>
+        <option value="854x480">854 x 480 (480p)</option>
+        <option value="640x360">640 x 360 (360p)</option>
+      </select>
+
+      <label for="cfg-fps">Frame rate</label>
+      <select id="cfg-fps">
+        <option value="60">60 fps</option>
+        <option value="30" selected>30 fps</option>
+        <option value="25">25 fps</option>
+        <option value="15">15 fps</option>
+      </select>
+
+      <label for="cfg-bitrate">Bitrate (kbps)</label>
+      <input id="cfg-bitrate" type="number" min="100" max="100000" step="100" value="6000" />
+
+      <label for="cfg-format">Raw format</label>
+      <select id="cfg-format">
+        <option value="I420" selected>I420</option>
+        <option value="NV12">NV12</option>
+        <option value="YUY2">YUY2</option>
+        <option value="BGRA">BGRA</option>
+      </select>
+
+      <button id="apply" class="full">Apply Settings</button>
+    </div>
+
     <div id="log"></div>
 
     <script>
@@ -102,8 +162,16 @@
       const statRes = document.getElementById("stat-res");
       const statLatency = document.getElementById("stat-latency");
 
+      const applyBtn = document.getElementById("apply");
+      const cfgRes = document.getElementById("cfg-res");
+      const cfgFps = document.getElementById("cfg-fps");
+      const cfgBitrate = document.getElementById("cfg-bitrate");
+      const cfgFormat = document.getElementById("cfg-format");
+
+      let ws;
       let pc;
       let statsInterval;
+      let streaming = false;
 
       function log(msg) {
         console.log(msg);
@@ -111,7 +179,28 @@
         logEl.scrollTop = logEl.scrollHeight;
       }
 
+      // Read the form into a VideoConfig matching the server's serde shape.
+      function readConfig() {
+        const [width, height] = cfgRes.value.split("x").map(Number);
+        return {
+          width,
+          height,
+          framerate: Number(cfgFps.value),
+          bitrate_kbps: Number(cfgBitrate.value),
+          format: cfgFormat.value,
+        };
+      }
+
+      // Push a server config back into the form controls.
+      function applyConfigToForm(cfg) {
+        cfgRes.value = `${cfg.width}x${cfg.height}`;
+        cfgFps.value = String(cfg.framerate);
+        cfgBitrate.value = String(cfg.bitrate_kbps);
+        cfgFormat.value = cfg.format;
+      }
+
       function startStatsLoop() {
+        clearInterval(statsInterval);
         let lastResult = null;
 
         statsInterval = setInterval(async () => {
@@ -174,10 +263,26 @@
         }, 1000);
       }
 
-      startBtn.addEventListener("click", async () => {
-        startBtn.disabled = true;
+      function send(obj) {
+        if (ws && ws.readyState === WebSocket.OPEN) {
+          ws.send(JSON.stringify(obj));
+        }
+      }
 
-        const ws = new WebSocket(`ws://${location.host}/ws`);
+      // Tear down the current RTCPeerConnection (used before reconnecting on a
+      // server reconfigure).
+      function teardownPeer() {
+        clearInterval(statsInterval);
+        if (pc) {
+          pc.close();
+          pc = null;
+        }
+        video.srcObject = null;
+      }
+
+      // Build a fresh peer connection and ask the server to start a stream.
+      function startPeer() {
+        teardownPeer();
         pc = new RTCPeerConnection({
           iceServers: [{ urls: "stun:stun.l.google.com:19302" }],
         });
@@ -193,19 +298,25 @@
 
         pc.onicecandidate = (event) => {
           if (event.candidate) {
-            ws.send(
-              JSON.stringify({
-                type: "ice_candidate",
-                candidate: event.candidate.candidate,
-                sdp_mline_index: event.candidate.sdpMLineIndex,
-              }),
-            );
+            send({
+              type: "ice_candidate",
+              candidate: event.candidate.candidate,
+              sdp_mline_index: event.candidate.sdpMLineIndex,
+            });
           }
         };
 
+        log("Sending start");
+        send({ type: "start" });
+      }
+
+      function connect() {
+        ws = new WebSocket(`ws://${location.host}/ws`);
+
         ws.onopen = () => {
-          log("WS open, sending start");
-          ws.send(JSON.stringify({ type: "start" }));
+          log("WS open");
+          send({ type: "get_config" }); // sync the form to the live config
+          if (streaming) startPeer();
         };
 
         ws.onmessage = async (event) => {
@@ -219,11 +330,13 @@
           log("<- " + msg.type);
 
           if (msg.type === "offer") {
+            if (!pc) return;
             await pc.setRemoteDescription({ type: "offer", sdp: msg.sdp });
             const answer = await pc.createAnswer();
             await pc.setLocalDescription(answer);
-            ws.send(JSON.stringify({ type: "answer", sdp: answer.sdp }));
+            send({ type: "answer", sdp: answer.sdp });
           } else if (msg.type === "ice_candidate") {
+            if (!pc) return;
             try {
               await pc.addIceCandidate({
                 candidate: msg.candidate,
@@ -232,15 +345,41 @@
             } catch (e) {
               log("addIceCandidate failed: " + e);
             }
+          } else if (msg.type === "config") {
+            applyConfigToForm(msg.config);
+            log("Config: " + JSON.stringify(msg.config));
+          } else if (msg.type === "reconfigured") {
+            // Server rebuilt the pipeline; our old branch is gone. Reconnect
+            // the peer if we were streaming.
+            log("Server reconfigured; reconnecting peer");
+            if (streaming) startPeer();
+          } else if (msg.type === "error") {
+            log("Server error: " + msg.message);
+            alert(msg.message);
           }
         };
 
         ws.onclose = () => {
           log("WS closed");
+          teardownPeer();
           startBtn.disabled = false;
-          clearInterval(statsInterval);
         };
+      }
+
+      startBtn.addEventListener("click", () => {
+        startBtn.disabled = true;
+        streaming = true;
+        startPeer();
       });
+
+      applyBtn.addEventListener("click", () => {
+        const config = readConfig();
+        log("Applying config: " + JSON.stringify(config));
+        send({ type: "set_config", config });
+      });
+
+      // Open the signaling socket on load so the form syncs to the live config.
+      connect();
     </script>
   </body>
 </html>

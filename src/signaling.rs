@@ -11,11 +11,29 @@ use axum::{
 };
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
 use crate::peer::Peer;
-use crate::pipeline::SharedPipeline;
+use crate::pipeline::{SharedPipeline, VideoConfig};
+
+/// Shared application state handed to every WebSocket connection.
+pub struct AppState {
+    pub pipeline: SharedPipeline,
+    /// Fires whenever the pipeline is reconfigured, so every connected client
+    /// can be told to tear down and reconnect to the rebuilt pipeline.
+    pub reconfigured_tx: broadcast::Sender<()>,
+}
+
+impl AppState {
+    pub fn new(pipeline: SharedPipeline) -> Self {
+        let (reconfigured_tx, _) = broadcast::channel(16);
+        Self {
+            pipeline,
+            reconfigured_tx,
+        }
+    }
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -31,20 +49,45 @@ pub enum SignalingMessage {
         candidate: String,
         sdp_mline_index: u32,
     },
+    /// Client asks for the current video config.
+    GetConfig,
+    /// Server's reply to `GetConfig`, also sent after a successful `SetConfig`.
+    Config {
+        config: VideoConfig,
+    },
+    /// Client requests new video params; triggers a live pipeline rebuild.
+    SetConfig {
+        config: VideoConfig,
+    },
+    /// Broadcast to all clients after a rebuild: drop your peer and reconnect.
+    Reconfigured,
+    /// Server -> client error (bad config, rebuild failure, ...).
+    Error {
+        message: String,
+    },
 }
 
-pub async fn ws_handler(
-    State(shared): State<Arc<SharedPipeline>>,
-    ws: WebSocketUpgrade,
-) -> Response {
-    ws.on_upgrade(move |socket| handle_socket(socket, shared))
+pub async fn ws_handler(State(state): State<Arc<AppState>>, ws: WebSocketUpgrade) -> Response {
+    ws.on_upgrade(move |socket| handle_socket(socket, state))
 }
 
-async fn handle_socket(socket: WebSocket, shared: Arc<SharedPipeline>) {
+async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
     info!("WebSocket client connected");
 
     let (mut ws_sink, mut ws_stream) = socket.split();
     let (outbound_tx, mut outbound_rx) = mpsc::unbounded_channel::<SignalingMessage>();
+
+    // Bridge the broadcast (reconfigure notifications) into this connection's
+    // outbound channel so the single writer task owns the sink.
+    let mut reconfigured_rx = state.reconfigured_tx.subscribe();
+    let reconfig_outbound = outbound_tx.clone();
+    let reconfig_task = tokio::spawn(async move {
+        while reconfigured_rx.recv().await.is_ok() {
+            if reconfig_outbound.send(SignalingMessage::Reconfigured).is_err() {
+                break;
+            }
+        }
+    });
 
     let forward_task = tokio::spawn(async move {
         while let Some(msg) = outbound_rx.recv().await {
@@ -79,13 +122,15 @@ async fn handle_socket(socket: WebSocket, shared: Arc<SharedPipeline>) {
         };
 
         match msg {
-            SignalingMessage::Start => match Peer::new(&shared, outbound_tx.clone()) {
-                Ok(p) => {
-                    info!("Peer branch attached to shared pipeline");
-                    peer = Some(p);
+            SignalingMessage::Start => {
+                match Peer::new(&state.pipeline, outbound_tx.clone()) {
+                    Ok(p) => {
+                        info!("Peer branch attached to shared pipeline");
+                        peer = Some(p);
+                    }
+                    Err(e) => error!("Failed to attach peer branch: {e:?}"),
                 }
-                Err(e) => error!("Failed to attach peer branch: {e:?}"),
-            },
+            }
             SignalingMessage::Answer { sdp } => match &peer {
                 Some(p) => {
                     if let Err(e) = p.handle_answer(&sdp) {
@@ -105,13 +150,46 @@ async fn handle_socket(socket: WebSocket, shared: Arc<SharedPipeline>) {
                 }
                 None => warn!("Got `ice_candidate` before `start`"),
             },
+            SignalingMessage::GetConfig => {
+                let config = state.pipeline.config();
+                let _ = outbound_tx.send(SignalingMessage::Config { config });
+            }
+            SignalingMessage::SetConfig { config } => {
+                info!("Reconfigure requested: {config:?}");
+                match state.pipeline.reconfigure(config) {
+                    Ok(()) => {
+                        // This peer's branch is now orphaned; drop it so the
+                        // client gets a clean reconnect via the broadcast below.
+                        peer = None;
+                        let new_config = state.pipeline.config();
+                        let _ = outbound_tx.send(SignalingMessage::Config {
+                            config: new_config,
+                        });
+                        // Tell every client (including this one) to reconnect.
+                        let _ = state.reconfigured_tx.send(());
+                        info!("Pipeline reconfigured");
+                    }
+                    Err(e) => {
+                        error!("Reconfigure failed: {e:?}");
+                        let _ = outbound_tx.send(SignalingMessage::Error {
+                            message: format!("Reconfigure failed: {e}"),
+                        });
+                    }
+                }
+            }
             SignalingMessage::Offer { .. } => {
                 warn!("Received unexpected `offer` from client; ignoring");
+            }
+            SignalingMessage::Config { .. }
+            | SignalingMessage::Reconfigured
+            | SignalingMessage::Error { .. } => {
+                warn!("Received server-only message from client; ignoring");
             }
         }
     }
 
     drop(peer);
     forward_task.abort();
+    reconfig_task.abort();
     info!("WebSocket client disconnected; peer branch removed");
 }

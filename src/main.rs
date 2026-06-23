@@ -16,6 +16,7 @@ mod pipeline;
 mod signaling;
 
 use crate::pipeline::SharedPipeline;
+use crate::signaling::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -34,14 +35,16 @@ async fn main() -> Result<()> {
 
     // Build and start the shared capture + encode pipeline. From here on the
     // camera is on and the encoder is running. New WebRTC clients tap in.
-    let shared = Arc::new(SharedPipeline::new()?);
-    shared.start()?;
+    let pipeline = SharedPipeline::new()?;
+    pipeline.start()?;
     info!("Shared pipeline running; camera is live");
+
+    let state = Arc::new(AppState::new(pipeline));
 
     let app = Router::new()
         .route("/ws", get(signaling::ws_handler))
-        .with_state(shared.clone())
-        .fallback_service(ServeDir::new("test-client"))
+        .with_state(state.clone())
+        .fallback_service(ServeDir::new("templates"))
         .layer(CorsLayer::permissive());
 
     let addr = SocketAddr::from(([0, 0, 0, 0], 8090));

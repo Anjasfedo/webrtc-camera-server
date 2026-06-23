@@ -119,8 +119,11 @@
     </div>
 
     <div id="config">
-      <!-- Resolution + frame-rate options are populated at runtime from the
-           camera's REAL capabilities (get_capabilities). They start empty. -->
+      <!-- Camera / resolution / frame-rate options are populated at runtime from
+           the connected devices' REAL capabilities (get_devices). Start empty. -->
+      <label for="cfg-device">Camera</label>
+      <select id="cfg-device"></select>
+
       <label for="cfg-res">Resolution</label>
       <select id="cfg-res"></select>
 
@@ -154,6 +157,7 @@
       const statLatency = document.getElementById("stat-latency");
 
       const applyBtn = document.getElementById("apply");
+      const cfgDevice = document.getElementById("cfg-device");
       const cfgRes = document.getElementById("cfg-res");
       const cfgFps = document.getElementById("cfg-fps");
       const cfgBitrate = document.getElementById("cfg-bitrate");
@@ -163,7 +167,7 @@
       let pc;
       let statsInterval;
       let streaming = false;
-      let caps = []; // real camera capture modes from the server
+      let devices = []; // connected cameras + their caps, from the server
 
       function log(msg) {
         console.log(msg);
@@ -171,10 +175,16 @@
         logEl.scrollTop = logEl.scrollHeight;
       }
 
-      // Distinct resolutions across all capture modes, sorted high-res first.
+      // Caps of the currently-selected camera (empty if none / not found).
+      function currentCaps() {
+        const dev = devices.find((d) => d.id === cfgDevice.value);
+        return dev ? dev.caps : [];
+      }
+
+      // Distinct resolutions for the selected camera, sorted high-res first.
       function distinctResolutions() {
         const seen = new Map(); // "WxH" -> {width, height}
-        for (const c of caps) {
+        for (const c of currentCaps()) {
           seen.set(`${c.width}x${c.height}`, { width: c.width, height: c.height });
         }
         return [...seen.values()].sort(
@@ -182,17 +192,33 @@
         );
       }
 
-      // Frame rates the camera supports AT a given resolution, descending.
+      // Frame rates the selected camera supports AT a resolution, descending.
       function frameRatesFor(width, height) {
         const set = new Set();
-        for (const c of caps) {
+        for (const c of currentCaps()) {
           if (c.width === width && c.height === height) set.add(c.framerate);
         }
         return [...set].sort((a, b) => b - a);
       }
 
-      // Rebuild the resolution dropdown from caps. Keeps the current selection
-      // if still valid. No-op when caps are empty (probe found nothing).
+      // Rebuild the camera dropdown from the device list, keeping the current
+      // selection if still present.
+      function populateDevices(selectedId) {
+        cfgDevice.innerHTML = "";
+        for (const d of devices) {
+          const opt = document.createElement("option");
+          opt.value = d.id;
+          opt.textContent = `${d.name} (${d.caps.length} modes)`;
+          cfgDevice.appendChild(opt);
+        }
+        if (selectedId && devices.some((d) => d.id === selectedId)) {
+          cfgDevice.value = selectedId;
+        }
+        populateResolutions();
+      }
+
+      // Rebuild the resolution dropdown for the selected camera. No-op when the
+      // camera advertises no modes.
       function populateResolutions(selected) {
         const resolutions = distinctResolutions();
         cfgRes.innerHTML = "";
@@ -231,12 +257,18 @@
           framerate: Number(cfgFps.value),
           bitrate_kbps: Number(cfgBitrate.value),
           format: cfgFormat.value,
+          device_id: cfgDevice.value || null,
         };
       }
 
-      // Push a server config back into the form controls. Ensures the option
-      // exists (caps may not have arrived yet) before selecting it.
+      // Push a server config back into the form controls. Ensures each option
+      // exists (device list may not have arrived yet) before selecting it.
       function applyConfigToForm(cfg) {
+        // Camera: select it if known; refresh res/fps from its caps.
+        if (cfg.device_id && devices.some((d) => d.id === cfg.device_id)) {
+          cfgDevice.value = cfg.device_id;
+          populateResolutions();
+        }
         const resVal = `${cfg.width}x${cfg.height}`;
         if (![...cfgRes.options].some((o) => o.value === resVal)) {
           const opt = document.createElement("option");
@@ -366,7 +398,7 @@
 
         ws.onopen = () => {
           log("WS open");
-          send({ type: "get_capabilities" }); // real camera modes for the form
+          send({ type: "get_devices" }); // cameras + modes for the form
           send({ type: "get_config" }); // then sync to the live config
           if (streaming) startPeer();
         };
@@ -397,11 +429,10 @@
             } catch (e) {
               log("addIceCandidate failed: " + e);
             }
-          } else if (msg.type === "capabilities") {
-            caps = msg.caps || [];
-            log(`Camera modes: ${caps.length}`);
-            const current = cfgRes.value || null;
-            populateResolutions(current);
+          } else if (msg.type === "devices") {
+            devices = msg.devices || [];
+            log(`Cameras: ${devices.length}`);
+            populateDevices(cfgDevice.value || null);
           } else if (msg.type === "config") {
             applyConfigToForm(msg.config);
             log("Config: " + JSON.stringify(msg.config));
@@ -432,6 +463,10 @@
         streaming = true;
         startPeer();
       });
+
+      // When the camera changes, rebuild resolution (and thus fps) from that
+      // device's caps.
+      cfgDevice.addEventListener("change", () => populateResolutions());
 
       // When the resolution changes, refresh the frame-rate list to only the
       // rates the camera supports at that resolution.

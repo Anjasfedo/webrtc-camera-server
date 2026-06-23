@@ -14,7 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{error, info, warn};
 
-use crate::camera::CameraCap;
+use crate::camera::CameraDevice;
 use crate::peer::Peer;
 use crate::pipeline::{SharedPipeline, VideoConfig};
 
@@ -56,11 +56,11 @@ pub enum SignalingMessage {
     Config {
         config: VideoConfig,
     },
-    /// Client asks what capture modes the real camera supports.
-    GetCapabilities,
-    /// Server's reply to `GetCapabilities`: the probed camera capture modes.
-    Capabilities {
-        caps: Vec<CameraCap>,
+    /// Client asks which cameras are connected and what each supports.
+    GetDevices,
+    /// Server's reply to `GetDevices`: connected cameras, each with its modes.
+    Devices {
+        devices: Vec<CameraDevice>,
     },
     /// Client requests new video params; triggers a live pipeline rebuild.
     SetConfig {
@@ -161,9 +161,9 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 let config = state.pipeline.config();
                 let _ = outbound_tx.send(SignalingMessage::Config { config });
             }
-            SignalingMessage::GetCapabilities => {
-                let caps = state.pipeline.capabilities();
-                let _ = outbound_tx.send(SignalingMessage::Capabilities { caps });
+            SignalingMessage::GetDevices => {
+                let devices = state.pipeline.devices();
+                let _ = outbound_tx.send(SignalingMessage::Devices { devices });
             }
             SignalingMessage::SetConfig { config } => {
                 info!("Reconfigure requested: {config:?}");
@@ -202,7 +202,7 @@ async fn handle_socket(socket: WebSocket, state: Arc<AppState>) {
                 warn!("Received unexpected `offer` from client; ignoring");
             }
             SignalingMessage::Config { .. }
-            | SignalingMessage::Capabilities { .. }
+            | SignalingMessage::Devices { .. }
             | SignalingMessage::Reconfigured
             | SignalingMessage::Error { .. } => {
                 warn!("Received server-only message from client; ignoring");

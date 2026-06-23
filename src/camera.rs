@@ -1,10 +1,11 @@
-//! Camera capability probing via GstDeviceMonitor.
+//! Camera enumeration + capability probing via GstDeviceMonitor.
 //!
-//! At startup we ask GStreamer what the real camera can actually deliver —
-//! every (format, width, height, framerate) combination it advertises — so the
-//! client can build resolution / framerate dropdowns from truth instead of
-//! hardcoded guesses. The camera ties these together (e.g. a webcam may do
-//! 1080p only at 30fps in NV12 but 5fps in YUY2), so we expose concrete combos.
+//! At startup we ask GStreamer which cameras are connected and what each can
+//! actually deliver — every (format, width, height, framerate) combo it
+//! advertises — so the client can build device / resolution / framerate
+//! dropdowns from truth instead of hardcoded guesses. A camera ties these
+//! together (e.g. 1080p only at 30fps in NV12 but 5fps in YUY2), so we expose
+//! concrete combos per device.
 
 use anyhow::Result;
 use gstreamer as gst;
@@ -25,69 +26,84 @@ pub struct CameraCap {
     pub framerate: u32,
 }
 
-/// Probe the first matching camera and return its advertised capture modes.
+/// One connected camera and its advertised capture modes.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CameraDevice {
+    /// Stable handle the pipeline uses to select this device. On mediafoundation
+    /// this is `device.path` (fed to `mfvideosrc device-path=...`). Empty if the
+    /// backend exposes no path (then we fall back to the default source).
+    pub id: String,
+    /// Human-readable name for the dropdown.
+    pub name: String,
+    /// The `device.api` this device belongs to, e.g. "mediafoundation".
+    pub api: String,
+    /// This device's real capture modes.
+    pub caps: Vec<CameraCap>,
+}
+
+/// Probe all connected cameras and their advertised capture modes.
 ///
-/// `prefer_api` filters to a specific `device.api` property (e.g.
+/// `only_api`, when set, keeps only devices whose `device.api` matches (e.g.
 /// "mediafoundation" on Windows so the list matches the `mfvideosrc` pipeline).
-/// Falls back to any `Video/Source` device if no match. Returns an empty vec
-/// (not an error) if probing finds nothing — the client then keeps its static
-/// defaults rather than the server failing to boot.
-pub fn probe_camera(prefer_api: Option<&str>) -> Result<Vec<CameraCap>> {
+/// Returns an empty vec (not an error) if probing finds nothing — the server
+/// then runs without a device list rather than failing to boot.
+pub fn probe_cameras(only_api: Option<&str>) -> Result<Vec<CameraDevice>> {
     let monitor = gst::DeviceMonitor::new();
     monitor.add_filter(Some("Video/Source"), None);
     monitor
         .start()
         .map_err(|e| anyhow::anyhow!("DeviceMonitor failed to start: {e}"))?;
 
-    let devices = monitor.devices();
+    let mut out: Vec<CameraDevice> = Vec::new();
+    for device in monitor.devices() {
+        let props = device.properties();
+        let api = props
+            .as_ref()
+            .and_then(|p| p.get::<String>("device.api").ok())
+            .unwrap_or_default();
 
-    // Pick the device whose `device.api` matches `prefer_api`, else the first.
-    let mut chosen: Option<gst::Device> = None;
-    let mut fallback: Option<gst::Device> = None;
-    for device in devices {
-        if fallback.is_none() {
-            fallback = Some(device.clone());
-        }
-        if let (Some(want), Some(props)) = (prefer_api, device.properties()) {
-            if props.get::<String>("device.api").ok().as_deref() == Some(want) {
-                chosen = Some(device);
-                break;
+        // Filter to the requested backend so we don't list the same physical
+        // camera twice under different APIs.
+        if let Some(want) = only_api {
+            if api != want {
+                continue;
             }
         }
-    }
-    let device = chosen.or(fallback);
 
-    let caps_list = match device {
-        Some(d) => {
-            info!("Probing camera caps: {}", d.display_name());
-            d.caps()
-        }
-        None => {
-            warn!("No Video/Source camera found; capability list will be empty");
-            monitor.stop();
-            return Ok(Vec::new());
-        }
-    };
+        let id = props
+            .as_ref()
+            .and_then(|p| p.get::<String>("device.path").ok())
+            .unwrap_or_default();
+        let name = device.display_name().to_string();
 
-    let mut out: Vec<CameraCap> = Vec::new();
-    if let Some(caps) = caps_list {
-        for s in caps.iter() {
-            collect_caps(s, &mut out);
+        let mut caps: Vec<CameraCap> = Vec::new();
+        if let Some(c) = device.caps() {
+            for s in c.iter() {
+                collect_caps(s, &mut caps);
+            }
         }
+        normalize_caps(&mut caps);
+
+        info!("Camera: {name} ({api}) — {} modes", caps.len());
+        out.push(CameraDevice { id, name, api, caps });
     }
 
     monitor.stop();
 
-    // Dedupe (different colorimetry/chroma variants collapse to the same combo)
-    // and sort high-res-first so the dropdown reads naturally.
-    out.dedup();
-    out.sort_by(|a, b| {
+    if out.is_empty() {
+        warn!("No matching Video/Source camera found; device list is empty");
+    }
+    Ok(out)
+}
+
+/// Dedupe (colorimetry/chroma variants collapse to the same combo) and sort
+/// high-res-first so dropdowns read naturally.
+fn normalize_caps(caps: &mut Vec<CameraCap>) {
+    caps.dedup();
+    caps.sort_by(|a, b| {
         (b.width, b.height, b.framerate, &b.format).cmp(&(a.width, a.height, a.framerate, &a.format))
     });
-    out.dedup();
-
-    info!("Camera advertises {} capture modes", out.len());
-    Ok(out)
+    caps.dedup();
 }
 
 /// Expand one caps structure into `CameraCap`s. width/height/framerate may be

@@ -26,7 +26,7 @@ use gstreamer as gst;
 use gstreamer::prelude::*;
 use serde::{Deserialize, Serialize};
 
-use crate::camera::CameraCap;
+use crate::camera::{CameraCap, CameraDevice};
 
 /// Mutable video parameters for the shared capture+encode chain.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -37,6 +37,10 @@ pub struct VideoConfig {
     pub bitrate_kbps: u32,
     /// Raw pixel format fed to the encoder, e.g. "I420" or "NV12".
     pub format: String,
+    /// Which camera to capture from (`CameraDevice::id`). `None` / empty = the
+    /// pipeline's default source (no explicit device selected).
+    #[serde(default)]
+    pub device_id: Option<String>,
 }
 
 impl Default for VideoConfig {
@@ -49,6 +53,7 @@ impl Default for VideoConfig {
             // mfh264enc (Windows) only accepts NV12 input; x264enc (Linux) is
             // happy with I420. Pick the encoder's native format per platform.
             format: default_format().to_string(),
+            device_id: None,
         }
     }
 }
@@ -133,8 +138,9 @@ fn capture_encode_head(cfg: &VideoConfig) -> String {
         // then bridges to the encoder's required input format. No videoscale:
         // we run the camera's real resolution, not a scaled approximation.
         // `low-latency=true` ~ zerolatency.
+        let device = device_path_arg(cfg.device_id.as_deref());
         format!(
-            "mfvideosrc ! \
+            "mfvideosrc{device} ! \
              video/x-raw,width={w},height={h},framerate={fps}/1 ! \
              videoconvert ! \
              video/x-raw,format={fmt} ! \
@@ -144,15 +150,35 @@ fn capture_encode_head(cfg: &VideoConfig) -> String {
 
     #[cfg(not(target_os = "windows"))]
     {
-        // x264enc bitrate is in kbit/s.
+        // x264enc bitrate is in kbit/s. On v4l2 the device id is the /dev path.
+        let device = cfg
+            .device_id
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or("/dev/video0");
         format!(
-            "v4l2src device=/dev/video0 ! \
+            "v4l2src device={device} ! \
              image/jpeg,width={w},height={h},framerate={fps}/1 ! \
              jpegdec ! \
              videoconvert ! \
              video/x-raw,format={fmt} ! \
              x264enc bitrate={br} tune=zerolatency speed-preset=ultrafast"
         )
+    }
+}
+
+/// Build the ` device-path="..."` argument for `mfvideosrc`, or an empty string
+/// for the default device. The MF device path contains backslashes and `#`/`{}`
+/// characters that `gst::parse::launch` would mis-tokenize, so we wrap it in
+/// quotes and escape backslashes and embedded quotes.
+#[cfg(target_os = "windows")]
+fn device_path_arg(device_id: Option<&str>) -> String {
+    match device_id.filter(|s| !s.is_empty()) {
+        Some(path) => {
+            let escaped = path.replace('\\', "\\\\").replace('"', "\\\"");
+            format!(" device-path=\"{escaped}\"")
+        }
+        None => String::new(),
     }
 }
 
@@ -205,6 +231,19 @@ fn pick_default_config(caps: &[CameraCap], base: &VideoConfig) -> VideoConfig {
     }
 }
 
+/// The capture modes for the device with `device_id`, or an empty slice if no
+/// device matches (no device selected, or it was unplugged since probing).
+fn caps_for<'a>(devices: &'a [CameraDevice], device_id: Option<&str>) -> &'a [CameraCap] {
+    let id = device_id.unwrap_or("");
+    devices
+        .iter()
+        .find(|d| d.id == id)
+        // When no id is set, fall back to the first device's caps.
+        .or_else(|| if id.is_empty() { devices.first() } else { None })
+        .map(|d| d.caps.as_slice())
+        .unwrap_or(&[])
+}
+
 /// The swappable inner state. Held behind a `Mutex` so `reconfigure` can tear
 /// the old pipeline down and stand a new one up while other handlers wait.
 struct Inner {
@@ -215,33 +254,36 @@ struct Inner {
 
 pub struct SharedPipeline {
     inner: Mutex<Inner>,
-    /// Real capture modes probed from the camera at startup. Empty if probing
-    /// found nothing (then `validate` falls back to generic bounds).
-    caps: Vec<CameraCap>,
+    /// All connected cameras + their real capture modes, probed at startup.
+    /// Empty if probing found nothing (then `validate` falls back to bounds).
+    devices: Vec<CameraDevice>,
 }
 
 impl SharedPipeline {
     pub fn new() -> Result<Self> {
-        // Probe the camera that matches our pipeline's source. On Windows the
-        // pipeline uses mfvideosrc, so prefer the mediafoundation device.
-        let prefer_api = if cfg!(target_os = "windows") {
+        // Probe cameras that match our pipeline's source. On Windows the
+        // pipeline uses mfvideosrc, so list only mediafoundation devices.
+        let only_api = if cfg!(target_os = "windows") {
             Some("mediafoundation")
         } else {
             None
         };
-        let caps = crate::camera::probe_camera(prefer_api).unwrap_or_else(|e| {
-            tracing::warn!("Camera probe failed: {e}; continuing without caps");
+        let devices = crate::camera::probe_cameras(only_api).unwrap_or_else(|e| {
+            tracing::warn!("Camera probe failed: {e}; continuing without devices");
             Vec::new()
         });
 
-        // Default to a real capture mode when caps are available; otherwise the
-        // static default. Prefer 1080p30, else the highest-res 30fps mode, else
-        // the first listed mode.
+        // Default to the first device and one of its real capture modes (prefer
+        // 1080p30, else highest-res at 30fps, else highest-res). Fall back to
+        // the static config when no device was found.
         let mut config = VideoConfig::default();
-        if !caps.is_empty() {
-            config = pick_default_config(&caps, &config);
+        if let Some(first) = devices.first() {
+            config.device_id = Some(first.id.clone()).filter(|s| !s.is_empty());
+            if !first.caps.is_empty() {
+                config = pick_default_config(&first.caps, &config);
+            }
         }
-        config.validate(&caps)?;
+        config.validate(caps_for(&devices, config.device_id.as_deref()))?;
 
         let (pipeline, tee) = build_pipeline(&config)?;
         Ok(Self {
@@ -250,13 +292,13 @@ impl SharedPipeline {
                 tee,
                 config,
             }),
-            caps,
+            devices,
         })
     }
 
-    /// The camera's advertised capture modes (for the client to build dropdowns).
-    pub fn capabilities(&self) -> Vec<CameraCap> {
-        self.caps.clone()
+    /// All connected cameras + their capture modes (for the client's dropdowns).
+    pub fn devices(&self) -> Vec<CameraDevice> {
+        self.devices.clone()
     }
 
     /// Start the capture/encode chain. Runs from server boot until shutdown.
@@ -286,7 +328,13 @@ impl SharedPipeline {
     /// references the old, now-stopped pipeline). The caller must drop all peers
     /// and have clients reconnect to tap the new pipeline.
     pub fn reconfigure(&self, new_config: VideoConfig) -> Result<bool> {
-        new_config.validate(&self.caps)?;
+        // Reject a device id we don't know about (unplugged, or never existed).
+        if let Some(id) = new_config.device_id.as_deref().filter(|s| !s.is_empty()) {
+            if !self.devices.is_empty() && !self.devices.iter().any(|d| d.id == id) {
+                return Err(anyhow!("unknown camera device: {id}"));
+            }
+        }
+        new_config.validate(caps_for(&self.devices, new_config.device_id.as_deref()))?;
 
         // No-op if nothing changed: avoid churning the live pipeline (and
         // bouncing every connected peer) on an Apply of identical settings.

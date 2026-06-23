@@ -2,3 +2,6 @@
 /logs
 *.log
 runpid.txt
+
+# Local env config; commit .env.example instead.
+.env

@@ -1,0 +1,27 @@
+# Run the server with the host camera passed through. Linux host only —
+# /dev/video0 and the `video` group don't exist on Docker Desktop (Win/Mac).
+services:
+  webrtc-camera-server:
+    build: .
+    image: webrtc-camera-server
+    ports:
+      - "8090:8090"
+    devices:
+      # Map the host camera into the container. Adjust if your camera is a
+      # different /dev/videoN.
+      - "/dev/video0:/dev/video0"
+    group_add:
+      # Grant access to the camera device's group (numeric gid of `video` on
+      # the host; 44 on Debian/Ubuntu — check with `getent group video`).
+      - "video"
+    environment:
+      WCS_PORT: "8090"
+      RUST_LOG: "webrtc_camera_server=info,tower_http=info"
+      # WCS_STUN: "stun://stun.l.google.com:19302"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:8090/healthz"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 10s

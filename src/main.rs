@@ -24,6 +24,14 @@ use crate::signaling::AppState;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // Load a local `.env` if present (real env vars still win). Absent file is
+    // fine — config has defaults. Must run before logging/config read env.
+    match dotenvy::dotenv() {
+        Ok(path) => eprintln!("Loaded env from {}", path.display()),
+        Err(e) if e.not_found() => {}
+        Err(e) => eprintln!("Warning: failed to load .env: {e}"),
+    }
+
     // Hold the guard until main returns so the background log writer keeps
     // flushing. Dropping it early would silence/lose buffered log lines.
     let _log_guard = logging::init()?;

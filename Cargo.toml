@@ -29,6 +29,9 @@ tracing-appender = "0.2"
 anyhow = "1"
 sysinfo = "0.38.4"
 
+# .env file loading
+dotenvy = "0.15"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

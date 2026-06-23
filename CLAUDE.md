@@ -39,7 +39,30 @@ exits immediately.
 | `RUST_LOG`            | `webrtc_camera_server=info,...`  | log filter                     |
 
 A present-but-unparseable value (e.g. non-numeric `WCS_PORT`) fails fast at
-startup rather than being silently ignored.
+startup rather than being silently ignored. A local `.env` (gitignored) is
+auto-loaded at startup via `dotenvy` — copy `.env.example` to `.env`; real
+environment variables override it.
+
+### Docker / deploy
+
+The `Dockerfile` is a multi-stage build (Rust builder → `debian:bookworm-slim`
+runtime with the GStreamer plugins the pipeline needs). It targets **Linux**, so
+the pipeline uses the `v4l2src`/`x264enc` head — the Windows `mfvideosrc` head is
+dev-only and never runs in the container.
+
+```bash
+docker build -t webrtc-camera-server .
+# Linux host with a camera at /dev/video0:
+docker run --rm -p 8090:8090 --device /dev/video0 --group-add video webrtc-camera-server
+# or:
+docker compose up --build
+```
+
+Camera passthrough (`--device /dev/video0`, `--group-add video`) needs a **Linux
+Docker host** — it does not work on Docker Desktop for Windows/Mac (no
+`/dev/videoN`). Build the image anywhere; run it where the camera is. The image
+runs as non-root (uid 10001, in the `video` group). `getent group video` on the
+host to confirm the gid if `--group-add video` by name doesn't resolve.
 
 ## Architecture
 

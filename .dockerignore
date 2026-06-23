@@ -1,0 +1,9 @@
+# Keep the build context small: the builder compiles from source, not artifacts.
+target/
+logs/
+.git/
+.env
+*.log
+runpid.txt
+.dockerignore
+Dockerfile

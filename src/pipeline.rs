@@ -162,7 +162,7 @@ fn camera_source(cfg: &VideoConfig, w: u32, h: u32, fps: u32, fmt: &str) -> Stri
         format!(
             "mfvideosrc{device} ! \
              video/x-raw,width={w},height={h},framerate={fps}/1 ! \
-             videoconvert ! \
+             videoconvert name=srcconv ! \
              video/x-raw,format={fmt}"
         )
     }
@@ -396,6 +396,51 @@ impl SharedPipeline {
         new_pipeline
             .set_state(gst::State::Playing)
             .context("Failed to start reconfigured pipeline")?;
+
+        // `set_state(Playing)` returns Async immediately for live sources — it does
+        // NOT verify the camera can deliver the requested mode. Caps negotiation
+        // (which fails for an unsupported resolution/framerate) happens later, on
+        // the bus. BLOCK here until the pipeline actually reaches Playing (or fails)
+        // so a bad config tears down the replacement and leaves the live stream
+        // intact, instead of silently swapping in a dead pipeline.
+        let (change, _, _) = new_pipeline.state(gst::ClockTime::from_seconds(5));
+        match change {
+            Ok(gst::StateChangeSuccess::Success | gst::StateChangeSuccess::NoPreroll) => {}
+            other => {
+                let _ = new_pipeline.set_state(gst::State::Null);
+                return Err(anyhow!(
+                    "camera could not deliver {}x{} @ {}fps (pipeline failed to reach Playing: {other:?})",
+                    new_config.width,
+                    new_config.height,
+                    new_config.framerate
+                ));
+            }
+        }
+
+        // Reaching Playing does NOT prove the camera honored the requested
+        // resolution: some sources (mfvideosrc) silently negotiate a different
+        // mode and still play. Read the caps actually negotiated on the source
+        // converter's sink pad and reject if they don't match what was asked.
+        if let Some(conv) = new_pipeline.by_name("srcconv") {
+            if let Some(caps) = conv.static_pad("sink").and_then(|p| p.current_caps()) {
+                if let Some(s) = caps.structure(0) {
+                    let got_w = s.get::<i32>("width").ok();
+                    let got_h = s.get::<i32>("height").ok();
+                    tracing::info!(
+                        "reconfigure negotiated camera caps: {:?}x{:?} (requested {}x{})",
+                        got_w, got_h, new_config.width, new_config.height
+                    );
+                    let want = (new_config.width as i32, new_config.height as i32);
+                    if (got_w, got_h) != (Some(want.0), Some(want.1)) {
+                        let _ = new_pipeline.set_state(gst::State::Null);
+                        return Err(anyhow!(
+                            "camera negotiated {:?}x{:?}, not the requested {}x{}; pick a real camera mode",
+                            got_w, got_h, new_config.width, new_config.height
+                        ));
+                    }
+                }
+            }
+        }
 
         let mut inner = self.inner.lock().unwrap();
         let old = std::mem::replace(
